@@ -45,7 +45,7 @@
 // D6 free (SD no longer used). D2 free but a boot strapping pin --
 // reserved for the battery voltage sensor divider once built.
 
-#define FIRMWARE_VERSION "v1.7"
+#define FIRMWARE_VERSION "v1.8"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -84,6 +84,25 @@ void saveDisplayRotation(int r) {
   LittleFS.remove("/display.txt");
   File f = LittleFS.open("/display.txt", FILE_WRITE);
   if (f) { f.print(r); f.close(); }
+}
+
+// Home screen icon "breathing" animation on/off. Toggled from Settings and
+// saved to /anim.txt so the choice survives a power cycle. Defaults to on.
+bool homeAnimationsEnabled = true;
+
+bool loadHomeAnimations() {
+  if (!LittleFS.exists("/anim.txt")) return true;
+  File f = LittleFS.open("/anim.txt");
+  if (!f) return true;
+  char c = f.available() ? f.read() : '1';
+  f.close();
+  return c != '0';
+}
+
+void saveHomeAnimations(bool on) {
+  LittleFS.remove("/anim.txt");
+  File f = LittleFS.open("/anim.txt", FILE_WRITE);
+  if (f) { f.print(on ? 1 : 0); f.close(); }
 }
 
 Adafruit_ILI9341 tft = Adafruit_ILI9341(&SPI, TFT_DC, TFT_CS, TFT_RST);
@@ -239,7 +258,7 @@ enum SnakeDir { SNAKE_UP, SNAKE_DOWN, SNAKE_LEFT, SNAKE_RIGHT };
 // ---- Settings list: everything that used to live on its own "More" tile
 // is now folded into the Settings screen as a scrollable/paged registry,
 // alongside Set Time / Set Date / WiFi. This freed up a Home tile slot. ----
-enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE };
+enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS };
 struct MoreItem {
   const char* name;
   MoreAction action;
@@ -248,6 +267,7 @@ MoreItem moreItems[] = {
   {"Set Time",             MORE_ACTION_SET_TIME},
   {"Set Date",             MORE_ACTION_SET_DATE},
   {"WiFi",                 MORE_ACTION_WIFI},
+  {"Animations",           MORE_ACTION_ANIMATIONS},
   {"About",                MORE_ACTION_ABOUT},
   {"Update Firmware",      MORE_ACTION_UPDATE},
   {"Clear To-Do List",     MORE_ACTION_CLEAR_TODO},
@@ -797,6 +817,7 @@ void drawTileIcon(int i, int radius) {
 }
 
 void updateHomeAnimations() {
+  if (!homeAnimationsEnabled) return;
   // Was gated to once every 300ms, which made the icon "breathing" pulse
   // look choppy/steppy. Running it far more often (every ~20ms, ~50fps)
   // makes the same wave motion look smooth instead -- the CPU has plenty
@@ -2505,10 +2526,14 @@ void drawSettingsScreen() {
                         moreItems[i].action == MORE_ACTION_SNAKE ||
                         moreItems[i].action == MORE_ACTION_SET_TIME ||
                         moreItems[i].action == MORE_ACTION_SET_DATE ||
-                        moreItems[i].action == MORE_ACTION_WIFI);
+                        moreItems[i].action == MORE_ACTION_WIFI ||
+                        moreItems[i].action == MORE_ACTION_ANIMATIONS);
     uint16_t color = safeAction ? COLOR_SETTINGS : COLOR_ERROR;
     drawGlassRect(20, rowY, 200, 40, 18, color);
-    printFitted(&FreeSansBold12pt7b, 120, rowY + 12, moreItems[i].name, ILI9341_WHITE, 188);
+    const char* label = moreItems[i].name;
+    if (moreItems[i].action == MORE_ACTION_ANIMATIONS)
+      label = homeAnimationsEnabled ? "Animations: On" : "Animations: Off";
+    printFitted(&FreeSansBold12pt7b, 120, rowY + 12, label, ILI9341_WHITE, 188);
     row++;
   }
 
@@ -2569,6 +2594,10 @@ void handleSettingsTouch(int x, int y) {
       } else if (action == MORE_ACTION_WIFI) {
         currentScreen = SCREEN_WIFI;
         drawWifiScreen();
+      } else if (action == MORE_ACTION_ANIMATIONS) {
+        homeAnimationsEnabled = !homeAnimationsEnabled;
+        saveHomeAnimations(homeAnimationsEnabled);
+        drawSettingsScreen();
       } else if (action == MORE_ACTION_ABOUT) {
         currentScreen = SCREEN_MORE_ABOUT;
         drawMoreAboutScreen();
@@ -2772,6 +2801,7 @@ void setup() {
   }
 
   displayRotation = loadDisplayRotation();
+  homeAnimationsEnabled = loadHomeAnimations();
   tft.setRotation(displayRotation);
 
   WiFi.mode(WIFI_STA);
