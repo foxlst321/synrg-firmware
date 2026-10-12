@@ -1,4 +1,5 @@
 # Notes for Claude
 
-- Whenever the firmware version changes (`FIRMWARE_VERSION` in the sketch),
-  also update the "Current version" line in `README.md` to match.
+- ALWAYS update `version.txt` whenever the firmware version changes
+  (`FIRMWARE_VERSION` in the sketch). They must match.
+- Keep the "Current version" line in `README.md` in sync too.
