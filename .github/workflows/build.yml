@@ -1,0 +1,40 @@
+name: Build firmware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'synrg/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core and libraries
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.12
+          arduino-cli lib install "Adafruit GFX Library" "Adafruit ILI9341" "XPT2046_Touchscreen" "RTClib" "ArduinoJson"
+
+      - name: Compile
+        run: arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PartitionScheme=default_8MB --output-dir build synrg
+
+      - name: Publish firmware.bin and version.txt
+        run: |
+          cp build/synrg.ino.bin firmware.bin
+          grep -oP '#define FIRMWARE_VERSION "\K[^"]+' synrg/synrg.ino > version.txt
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add firmware.bin version.txt
+          git commit -m "Build firmware $(cat version.txt)" || exit 0
+          git push

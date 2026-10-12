@@ -1,5 +1,10 @@
 # Notes for Claude
 
-- ALWAYS update `version.txt` whenever the firmware version changes
-  (`FIRMWARE_VERSION` in the sketch). They must match.
-- Keep the "Current version" line in `README.md` in sync too.
+- The sketch lives at `synrg/synrg.ino` (folder name must match file name).
+- For every requested change: edit `synrg/synrg.ino` AND bump
+  `#define FIRMWARE_VERSION` by one step (v1.8 -> v1.9 ...). The PDA only
+  offers an update when that number changes.
+- ALWAYS update `version.txt` to match `FIRMWARE_VERSION`, and keep the
+  "Current version" line in `README.md` in sync.
+- `.github/workflows/build.yml` compiles on every push to `main` touching
+  `synrg/**` and commits `firmware.bin` + `version.txt`.
