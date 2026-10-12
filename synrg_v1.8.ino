@@ -25,6 +25,7 @@
 #include <Adafruit_ILI9341.h>
 #include <XPT2046_Touchscreen.h>
 #include "RTClib.h"
+#include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
@@ -105,6 +106,32 @@ void saveHomeAnimations(bool on) {
   if (f) { f.print(on ? 1 : 0); f.close(); }
 }
 
+// Which widget the top-left Home tile shows. Cycled from Settings and saved
+// to /widget.txt so it survives a power cycle. Defaults to class status.
+enum HomeWidget { WIDGET_CLASS, WIDGET_NEXT_CLASS, WIDGET_CLOCK, WIDGET_WEATHER, WIDGET_TODO, WIDGET_COUNT };
+const char* widgetNames[WIDGET_COUNT] = {"Class", "Next Class", "Clock", "Weather", "To-Do"};
+int homeWidget = WIDGET_CLASS;
+
+int loadHomeWidget() {
+  if (!LittleFS.exists("/widget.txt")) return WIDGET_CLASS;
+  File f = LittleFS.open("/widget.txt");
+  if (!f) return WIDGET_CLASS;
+  char buf[4];
+  int i = 0;
+  while (f.available() && i < 3) buf[i++] = f.read();
+  buf[i] = '\0';
+  f.close();
+  int w = atoi(buf);
+  if (w < 0 || w >= WIDGET_COUNT) w = WIDGET_CLASS;
+  return w;
+}
+
+void saveHomeWidget(int w) {
+  LittleFS.remove("/widget.txt");
+  File f = LittleFS.open("/widget.txt", FILE_WRITE);
+  if (f) { f.print(w); f.close(); }
+}
+
 Adafruit_ILI9341 tft = Adafruit_ILI9341(&SPI, TFT_DC, TFT_CS, TFT_RST);
 XPT2046_Touchscreen ts(T_CS);
 RTC_PCF8563 rtc;
@@ -147,7 +174,7 @@ const char* dayNames[7] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
 
 uint16_t COLOR_BG, COLOR_TEXT, COLOR_SUBTEXT, COLOR_ACCENT, COLOR_STATUSBAR, COLOR_ERROR;
 uint16_t COLOR_TODO, COLOR_NOTES, COLOR_HOMEWORK, COLOR_WEATHER, COLOR_SETTINGS, COLOR_MORE;
-uint16_t COLOR_FRAME, COLOR_SHADOW;
+uint16_t COLOR_FRAME, COLOR_SHADOW, COLOR_BLUE, COLOR_GRAY;
 uint16_t tileColors[6];
 
 enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA };
@@ -258,7 +285,7 @@ enum SnakeDir { SNAKE_UP, SNAKE_DOWN, SNAKE_LEFT, SNAKE_RIGHT };
 // ---- Settings list: everything that used to live on its own "More" tile
 // is now folded into the Settings screen as a scrollable/paged registry,
 // alongside Set Time / Set Date / WiFi. This freed up a Home tile slot. ----
-enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS };
+enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET };
 struct MoreItem {
   const char* name;
   MoreAction action;
@@ -268,6 +295,7 @@ MoreItem moreItems[] = {
   {"Set Date",             MORE_ACTION_SET_DATE},
   {"WiFi",                 MORE_ACTION_WIFI},
   {"Animations",           MORE_ACTION_ANIMATIONS},
+  {"Home Widget",          MORE_ACTION_WIDGET},
   {"About",                MORE_ACTION_ABOUT},
   {"Update Firmware",      MORE_ACTION_UPDATE},
   {"Clear To-Do List",     MORE_ACTION_CLEAR_TODO},
@@ -1246,11 +1274,18 @@ void drawTileFrame(int x, int y, int w, int h, uint16_t color, const char* label
   tft.print(label);
 }
 
+// Small back arrow at the left of the Home status bar -- tapping it
+// returns to the lock screen.
+bool touchedHomeLockArrow(int x, int y) { return x < 36 && y < 28; }
+
 void drawHomeStatusBar(DateTime now) {
   tft.fillRect(0, 0, 240, 24, COLOR_STATUSBAR);
+  tft.drawRoundRect(4, 3, 24, 18, 4, COLOR_GRAY);
+  tft.fillTriangle(10, 12, 16, 7, 16, 17, ILI9341_WHITE);
+  tft.fillRect(16, 10, 6, 5, ILI9341_WHITE);
   tft.setTextColor(ILI9341_WHITE);
   tft.setTextSize(1);
-  tft.setCursor(8, 8);
+  tft.setCursor(36, 8);
   tft.print(dayNames[now.dayOfTheWeek()]);
   char dateStr[8];
   sprintf(dateStr, "%02d/%02d", now.month(), now.day());
@@ -1264,39 +1299,90 @@ void drawHomeStatusBar(DateTime now) {
   tft.print(timeStr);
 }
 
-// Slot 0 (top-left) is a live status widget rather than an app launcher --
-// it just shows the current class period and time left, refreshed every
-// minute along with the rest of the Home screen. Tapping it does nothing;
-// it's meant to be glanced at. Swap this out for a different widget later
-// if you'd rather show something else here.
+// Slot 0 (top-left) is a live widget rather than an app launcher. Which
+// widget it shows is picked in Settings ("Widget: ..."); it's refreshed
+// every minute along with the rest of the Home screen. Tapping it does
+// nothing -- it's meant to be glanced at.
+int countFileLines(const char* path) {
+  if (!LittleFS.exists(path)) return 0;
+  File f = LittleFS.open(path);
+  if (!f) return 0;
+  int n = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) n++;
+  }
+  f.close();
+  return n;
+}
+
 void drawWidgetTile() {
   DateTime now = rtc.now();
   drawGlassRect(tileX[0], tileY[0], tileW, tileH, 20, tileColors[0]);
 
-  int idx = getCurrentPeriodIndex(now.hour(), now.minute());
+  int x = tileX[0] + 10, y = tileY[0];
+  int nowMinutes = now.hour() * 60 + now.minute();
+  char buf[24];
   tft.setTextColor(ILI9341_WHITE);
   tft.setTextSize(1);
 
-  if (idx == -1) {
-    tft.setCursor(tileX[0] + 10, tileY[0] + 30);
-    tft.print("No class");
-    tft.setCursor(tileX[0] + 10, tileY[0] + 44);
-    tft.print("right now");
-  } else {
-    int nowMinutes = now.hour() * 60 + now.minute();
-    int endMinutes = schedule[idx].endHour * 60 + schedule[idx].endMin;
-    char buf[16];
-
-    tft.setCursor(tileX[0] + 10, tileY[0] + 24);
-    tft.print(schedule[idx].name);
-
-    sprintf(buf, "%d min left", endMinutes - nowMinutes);
-    tft.setCursor(tileX[0] + 10, tileY[0] + 44);
-    tft.print(buf);
+  switch (homeWidget) {
+    case WIDGET_NEXT_CLASS: {
+      int next = -1;
+      for (int i = 0; i < numPeriods; i++) {
+        int start = schedule[i].startHour * 60 + schedule[i].startMin;
+        if (start > nowMinutes && (next == -1 || start < schedule[next].startHour * 60 + schedule[next].startMin)) next = i;
+      }
+      if (next == -1) {
+        tft.setCursor(x, y + 30); tft.print("No more");
+        tft.setCursor(x, y + 44); tft.print("classes");
+      } else {
+        tft.setCursor(x, y + 24); tft.print(schedule[next].name);
+        formatTime12h(buf, schedule[next].startHour, schedule[next].startMin);
+        tft.setCursor(x, y + 44); tft.print(buf);
+      }
+      break;
+    }
+    case WIDGET_CLOCK:
+      formatTime12h(buf, now.hour(), now.minute());
+      printFitted(&FreeSansBold12pt7b, tileX[0] + tileW / 2, y + 26, buf, ILI9341_WHITE, tileW - 12);
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setTextSize(1);
+      break;
+    case WIDGET_WEATHER:
+      printFitted(&FreeSansBold12pt7b, tileX[0] + tileW / 2, y + 22, weatherTemp, ILI9341_WHITE, tileW - 12);
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setTextSize(1);
+      snprintf(buf, sizeof(buf), "%.14s", weatherDesc);
+      tft.setCursor(x, y + 48); tft.print(buf);
+      break;
+    case WIDGET_TODO: {
+      int n = countFileLines("/todo.txt");
+      snprintf(buf, sizeof(buf), "%d", n);
+      printFitted(&FreeSansBold12pt7b, tileX[0] + tileW / 2, y + 22, buf, ILI9341_WHITE, tileW - 12);
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setTextSize(1);
+      tft.setCursor(x, y + 48); tft.print(n == 1 ? "item to do" : "items to do");
+      break;
+    }
+    default: { // WIDGET_CLASS
+      int idx = getCurrentPeriodIndex(now.hour(), now.minute());
+      if (idx == -1) {
+        tft.setCursor(x, y + 30); tft.print("No class");
+        tft.setCursor(x, y + 44); tft.print("right now");
+      } else {
+        int endMinutes = schedule[idx].endHour * 60 + schedule[idx].endMin;
+        tft.setCursor(x, y + 24); tft.print(schedule[idx].name);
+        sprintf(buf, "%d min left", endMinutes - nowMinutes);
+        tft.setCursor(x, y + 44); tft.print(buf);
+      }
+      break;
+    }
   }
 
-  tft.setCursor(tileX[0] + 10, tileY[0] + tileH - 16);
-  tft.print("Status");
+  tft.setCursor(x, y + tileH - 16);
+  tft.print(widgetNames[homeWidget]);
 }
 
 void drawHomeScreen(DateTime now) {
@@ -1312,6 +1398,13 @@ void drawHomeScreen(DateTime now) {
 }
 
 void handleHomeTouch(int x, int y) {
+  if (touchedHomeLockArrow(x, y)) {
+    DateTime now = rtc.now();
+    currentScreen = SCREEN_LOCK;
+    drawLockScreen(now);
+    lastDrawnMinute = now.minute();
+    return;
+  }
   for (int i = 0; i < 6; i++) {
     if (x >= tileX[i] && x <= tileX[i] + tileW && y >= tileY[i] && y <= tileY[i] + tileH) {
       if (i == 0) {
@@ -2349,7 +2442,7 @@ void drawOtaScreen() {
   }
 
   bool install = (otaState == OTA_AVAILABLE);
-  drawGlassRect(40, 200, 160, 46, 18, install ? COLOR_ACCENT : COLOR_SETTINGS);
+  drawGlassRect(40, 200, 160, 46, 18, install ? COLOR_ACCENT : COLOR_BLUE);
   printFitted(&FreeSansBold12pt7b, 120, 214, install ? "Install" : "Check", ILI9341_WHITE, 140);
 }
 
@@ -2527,12 +2620,18 @@ void drawSettingsScreen() {
                         moreItems[i].action == MORE_ACTION_SET_TIME ||
                         moreItems[i].action == MORE_ACTION_SET_DATE ||
                         moreItems[i].action == MORE_ACTION_WIFI ||
-                        moreItems[i].action == MORE_ACTION_ANIMATIONS);
+                        moreItems[i].action == MORE_ACTION_ANIMATIONS ||
+                        moreItems[i].action == MORE_ACTION_WIDGET);
     uint16_t color = safeAction ? COLOR_SETTINGS : COLOR_ERROR;
     drawGlassRect(20, rowY, 200, 40, 18, color);
     const char* label = moreItems[i].name;
     if (moreItems[i].action == MORE_ACTION_ANIMATIONS)
       label = homeAnimationsEnabled ? "Animations: On" : "Animations: Off";
+    char widgetLabel[32];
+    if (moreItems[i].action == MORE_ACTION_WIDGET) {
+      snprintf(widgetLabel, sizeof(widgetLabel), "Widget: %s", widgetNames[homeWidget]);
+      label = widgetLabel;
+    }
     printFitted(&FreeSansBold12pt7b, 120, rowY + 12, label, ILI9341_WHITE, 188);
     row++;
   }
@@ -2544,7 +2643,7 @@ void drawSettingsScreen() {
 
     char pageBuf[12];
     sprintf(pageBuf, "%d / %d", settingsPage + 1, totalPages);
-    printCentered(&FreeSans12pt7b, 120, 282, pageBuf, COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 283, pageBuf, COLOR_SUBTEXT);
 
     drawGlassRect(140, 270, 80, 36, 16, COLOR_SUBTEXT);
     printFitted(&FreeSansBold12pt7b, 180, 282, "Next >", ILI9341_WHITE, 70);
@@ -2597,6 +2696,10 @@ void handleSettingsTouch(int x, int y) {
       } else if (action == MORE_ACTION_ANIMATIONS) {
         homeAnimationsEnabled = !homeAnimationsEnabled;
         saveHomeAnimations(homeAnimationsEnabled);
+        drawSettingsScreen();
+      } else if (action == MORE_ACTION_WIDGET) {
+        homeWidget = (homeWidget + 1) % WIDGET_COUNT;
+        saveHomeWidget(homeWidget);
         drawSettingsScreen();
       } else if (action == MORE_ACTION_ABOUT) {
         currentScreen = SCREEN_MORE_ABOUT;
@@ -2802,6 +2905,7 @@ void setup() {
 
   displayRotation = loadDisplayRotation();
   homeAnimationsEnabled = loadHomeAnimations();
+  homeWidget = loadHomeWidget();
   tft.setRotation(displayRotation);
 
   WiFi.mode(WIFI_STA);
@@ -2820,6 +2924,8 @@ void setup() {
   COLOR_WEATHER   = tft.color565(240, 180, 120);
   COLOR_SETTINGS  = tft.color565(190, 170, 150);
   COLOR_MORE      = tft.color565(220, 160, 170);
+  COLOR_BLUE      = tft.color565(90, 150, 220);
+  COLOR_GRAY      = tft.color565(170, 170, 170);
 
   tileColors[0] = COLOR_MORE;      // widget tile background
   tileColors[1] = COLOR_TODO;
