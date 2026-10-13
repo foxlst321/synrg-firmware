@@ -58,7 +58,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v2.0"
+#define FIRMWARE_VERSION "v2.1"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -1354,6 +1354,50 @@ void handleTouchTestTouch(int x, int y) {
 }
 
 // ============================================================
+// SHARED: live IP line on the Home and Lock screens. Shows the PDA's
+// address (the one to type into a browser for the built-in web page), or
+// the WiFi state when there isn't one. updateIpLine() redraws it whenever
+// that text changes, so it stays live between the once-a-minute redraws.
+// ============================================================
+char shownIpText[32] = "";
+
+void buildIpText(char* buf, size_t len) {
+  if (WiFi.status() == WL_CONNECTED) {
+    IPAddress ip = WiFi.localIP();
+    snprintf(buf, len, "IP: %d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+  } else if (wifiConnState == WIFI_CONN_CONNECTING) {
+    snprintf(buf, len, "WiFi: connecting...");
+  } else {
+    snprintf(buf, len, "WiFi: not connected");
+  }
+}
+
+int ipLineY() { return currentScreen == SCREEN_LOCK ? 280 : 302; }
+
+void drawIpLine() {
+  buildIpText(shownIpText, sizeof(shownIpText));
+  int y = ipLineY();
+  tft.fillRect(4, y - 2, 232, 12, COLOR_BG);
+  tft.setFont();
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_SUBTEXT);
+  int16_t x1, y1; uint16_t tw, th;
+  tft.getTextBounds(shownIpText, 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor((240 - tw) / 2, y);
+  tft.print(shownIpText);
+}
+
+unsigned long lastIpCheckMs = 0;
+void updateIpLine() {
+  if (currentScreen != SCREEN_HOME && currentScreen != SCREEN_LOCK) return;
+  if (millis() - lastIpCheckMs < 1000) return;
+  lastIpCheckMs = millis();
+  char now[32];
+  buildIpText(now, sizeof(now));
+  if (strcmp(now, shownIpText) != 0) drawIpLine();
+}
+
+// ============================================================
 // UI: LOCK SCREEN
 // ============================================================
 void drawLockScreen(DateTime now) {
@@ -1388,6 +1432,8 @@ void drawLockScreen(DateTime now) {
   tft.getTextBounds(hint, 0, 0, &x1, &y1, &tw, &th);
   tft.setCursor((240 - tw) / 2, 260);
   tft.print(hint);
+
+  drawIpLine();
 }
 
 // ============================================================
@@ -1524,6 +1570,7 @@ void drawHomeScreen(DateTime now) {
     drawTileFrame(tileX[i], tileY[i], tileW, tileH, tileColors[i], tileNames[i]);
     drawTileIcon(i, 20);
   }
+  drawIpLine();
 }
 
 void handleHomeTouch(int x, int y) {
@@ -3238,6 +3285,7 @@ void loop() {
   }
 
   maybeReinitDisplay(now);
+  updateIpLine();
 
   wasTouched = touchedNow;
 
