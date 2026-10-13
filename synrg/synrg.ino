@@ -46,6 +46,10 @@
 // D6 free (SD no longer used). D2 free but a boot strapping pin --
 // reserved for the battery voltage sensor divider once built.
 
+// Settings actions -- declared up here so the Arduino IDE's auto-generated
+// function prototypes can see the type.
+enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME };
+
 // Theme palette types (see the THEMES block further down).
 struct RGB { uint8_t r, g, b; };
 struct Theme {
@@ -394,7 +398,6 @@ enum SnakeDir { SNAKE_UP, SNAKE_DOWN, SNAKE_LEFT, SNAKE_RIGHT };
 // ---- Settings list: everything that used to live on its own "More" tile
 // is now folded into the Settings screen as a scrollable/paged registry,
 // alongside Set Time / Set Date / WiFi. This freed up a Home tile slot. ----
-enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME };
 struct MoreItem {
   const char* name;
   MoreAction action;
