@@ -46,7 +46,15 @@
 // D6 free (SD no longer used). D2 free but a boot strapping pin --
 // reserved for the battery voltage sensor divider once built.
 
-#define FIRMWARE_VERSION "v1.9"
+// Theme palette types (see the THEMES block further down).
+struct RGB { uint8_t r, g, b; };
+struct Theme {
+  const char* name;
+  RGB bg, text, subtext, accent, statusbar, error, frame, shadow, surface;
+  RGB todo, notes, homework, weather, settings, more;
+};
+
+#define FIRMWARE_VERSION "v2.0"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -132,8 +140,64 @@ void saveHomeWidget(int w) {
   if (f) { f.print(w); f.close(); }
 }
 
+// ---- Themes: every screen draws with the COLOR_* globals, so a theme just
+// swaps that whole palette at once. Six presets plus a Custom theme built
+// from a Light/Dark base and an accent color. Saved to /theme.txt as
+// "theme,customBase,customAccent" so it survives a power cycle. ----
+const Theme themes[] = {
+  {"Nook",     {250,240,222}, {90,62,40},    {150,120,90},  {110,175,100}, {200,150,100}, {220,100,90}, {220,195,160}, {215,190,165}, {255,255,255},
+               {140,200,220}, {190,160,210}, {140,200,140}, {240,180,120}, {190,170,150}, {220,160,170}},
+  {"Midnight", {24,26,38},    {230,230,240}, {150,155,175}, {110,180,255}, {45,50,80},    {230,95,95},  {55,60,85},    {8,8,14},      {44,48,66},
+               {70,140,200},  {140,100,190}, {70,160,110},  {210,140,70},  {100,105,130}, {190,90,130}},
+  {"Ocean",    {225,240,248}, {20,60,90},    {80,120,150},  {0,150,190},   {40,110,160},  {220,90,90},  {170,205,225}, {185,212,230}, {255,255,255},
+               {80,170,220},  {120,140,220}, {60,180,170},  {250,180,90},  {120,160,190}, {240,140,160}},
+  {"Forest",   {232,240,225}, {40,65,40},    {100,125,95},  {80,150,70},   {90,130,80},   {200,90,70},  {190,210,175}, {200,215,190}, {255,255,255},
+               {110,170,150}, {160,150,200}, {120,180,100}, {220,170,90},  {150,165,130}, {210,150,140}},
+  {"Sunset",   {255,236,225}, {90,40,50},    {160,100,100}, {240,120,80},  {220,100,110}, {200,60,70},  {245,200,190}, {240,205,195}, {255,255,255},
+               {250,160,120}, {220,130,170}, {240,190,100}, {250,140,90},  {200,150,160}, {180,120,200}},
+  {"Mono",     {240,240,240}, {30,30,30},    {110,110,110}, {60,60,60},    {70,70,70},    {200,60,60},  {200,200,200}, {205,205,205}, {255,255,255},
+               {110,110,110}, {130,130,130}, {90,90,90},    {150,150,150}, {120,120,120}, {100,100,100}},
+};
+const int presetThemeCount = sizeof(themes) / sizeof(themes[0]);
+const int THEME_CUSTOM = presetThemeCount;   // index just past the presets
+const int themeCount = presetThemeCount + 1;
+
+const char* customBaseNames[2] = {"Light", "Dark"};
+const RGB customAccents[8] = {
+  {110,175,100}, {90,150,220}, {0,170,170}, {150,110,210},
+  {230,110,160}, {230,90,80},  {240,150,60}, {200,170,40},
+};
+
+int currentTheme = 0;
+int customBase = 0;     // 0 = Light (Nook-based), 1 = Dark (Midnight-based)
+int customAccent = 0;   // index into customAccents
+
+void loadThemeSettings() {
+  if (!LittleFS.exists("/theme.txt")) return;
+  File f = LittleFS.open("/theme.txt");
+  if (!f) return;
+  char buf[16];
+  int i = 0;
+  while (f.available() && i < 15) buf[i++] = f.read();
+  buf[i] = '\0';
+  f.close();
+  int t = 0, b = 0, a = 0;
+  sscanf(buf, "%d,%d,%d", &t, &b, &a);
+  currentTheme = (t >= 0 && t < themeCount) ? t : 0;
+  customBase = (b == 1) ? 1 : 0;
+  customAccent = (a >= 0 && a < 8) ? a : 0;
+}
+
+void saveThemeSettings() {
+  LittleFS.remove("/theme.txt");
+  File f = LittleFS.open("/theme.txt", FILE_WRITE);
+  if (f) { f.printf("%d,%d,%d", currentTheme, customBase, customAccent); f.close(); }
+}
+
 Adafruit_ILI9341 tft = Adafruit_ILI9341(&SPI, TFT_DC, TFT_CS, TFT_RST);
 XPT2046_Touchscreen ts(T_CS);
+
+
 RTC_PCF8563 rtc;
 WebServer server(80);
 
@@ -174,10 +238,55 @@ const char* dayNames[7] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
 
 uint16_t COLOR_BG, COLOR_TEXT, COLOR_SUBTEXT, COLOR_ACCENT, COLOR_STATUSBAR, COLOR_ERROR;
 uint16_t COLOR_TODO, COLOR_NOTES, COLOR_HOMEWORK, COLOR_WEATHER, COLOR_SETTINGS, COLOR_MORE;
-uint16_t COLOR_FRAME, COLOR_SHADOW, COLOR_BLUE, COLOR_GRAY;
+uint16_t COLOR_FRAME, COLOR_SHADOW, COLOR_BLUE, COLOR_GRAY, COLOR_SURFACE;
 uint16_t tileColors[6];
 
-enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA };
+uint16_t rgb565(RGB c) { return tft.color565(c.r, c.g, c.b); }
+RGB darkenRGB(RGB c, int amt) {
+  RGB o = { (uint8_t)(c.r > amt ? c.r - amt : 0), (uint8_t)(c.g > amt ? c.g - amt : 0), (uint8_t)(c.b > amt ? c.b - amt : 0) };
+  return o;
+}
+
+// Loads a theme into the global palette. Custom = the Light (Nook) or Dark
+// (Midnight) base with the chosen accent, and a darker shade of that accent
+// for the status bar.
+void applyTheme(int idx) {
+  Theme t = themes[0];
+  if (idx == THEME_CUSTOM) {
+    t = themes[customBase == 1 ? 1 : 0];
+    RGB a = customAccents[customAccent];
+    t.accent = a;
+    t.statusbar = darkenRGB(a, 40);
+  } else if (idx >= 0 && idx < presetThemeCount) {
+    t = themes[idx];
+  }
+  COLOR_BG        = rgb565(t.bg);
+  COLOR_TEXT      = rgb565(t.text);
+  COLOR_SUBTEXT   = rgb565(t.subtext);
+  COLOR_ACCENT    = rgb565(t.accent);
+  COLOR_STATUSBAR = rgb565(t.statusbar);
+  COLOR_ERROR     = rgb565(t.error);
+  COLOR_FRAME     = rgb565(t.frame);
+  COLOR_SHADOW    = rgb565(t.shadow);
+  COLOR_SURFACE   = rgb565(t.surface);
+  COLOR_TODO      = rgb565(t.todo);
+  COLOR_NOTES     = rgb565(t.notes);
+  COLOR_HOMEWORK  = rgb565(t.homework);
+  COLOR_WEATHER   = rgb565(t.weather);
+  COLOR_SETTINGS  = rgb565(t.settings);
+  COLOR_MORE      = rgb565(t.more);
+  COLOR_BLUE      = tft.color565(90, 150, 220);
+  COLOR_GRAY      = tft.color565(170, 170, 170);
+
+  tileColors[0] = COLOR_MORE;      // widget tile background
+  tileColors[1] = COLOR_TODO;
+  tileColors[2] = COLOR_NOTES;
+  tileColors[3] = COLOR_HOMEWORK;
+  tileColors[4] = COLOR_WEATHER;
+  tileColors[5] = COLOR_SETTINGS;
+}
+
+enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM };
 Screen currentScreen = SCREEN_LOCK;
 bool firstBootFlow = false;   // true while walking through welcome -> touch test -> set time -> set date
 int touchTestResult = 0;      // 0 = waiting for tap, 1 = pass, 2 = fail (mirrored)
@@ -285,7 +394,7 @@ enum SnakeDir { SNAKE_UP, SNAKE_DOWN, SNAKE_LEFT, SNAKE_RIGHT };
 // ---- Settings list: everything that used to live on its own "More" tile
 // is now folded into the Settings screen as a scrollable/paged registry,
 // alongside Set Time / Set Date / WiFi. This freed up a Home tile slot. ----
-enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET };
+enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME };
 struct MoreItem {
   const char* name;
   MoreAction action;
@@ -296,6 +405,7 @@ MoreItem moreItems[] = {
   {"WiFi",                 MORE_ACTION_WIFI},
   {"Animations",           MORE_ACTION_ANIMATIONS},
   {"Home Widget",          MORE_ACTION_WIDGET},
+  {"Theme",                MORE_ACTION_THEME},
   {"About",                MORE_ACTION_ABOUT},
   {"Update Firmware",      MORE_ACTION_UPDATE},
   {"Clear To-Do List",     MORE_ACTION_CLEAR_TODO},
@@ -306,8 +416,24 @@ MoreItem moreItems[] = {
 };
 const int moreItemCount = sizeof(moreItems) / sizeof(moreItems[0]);
 MoreAction pendingConfirmAction;
-int settingsPage = 0;
-const int SETTINGS_ITEMS_PER_PAGE = 4;
+// Settings is a two-level menu: a list of categories, each opening a short
+// list of the actions above. Every original button lives in exactly one
+// category. settingsCategory == -1 means the top-level category list.
+struct SettingsCategory {
+  const char* name;
+  MoreAction items[3];
+  int count;
+};
+SettingsCategory settingsCategories[] = {
+  {"Appearance",     {MORE_ACTION_THEME, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET}, 3},
+  {"Time & Date",    {MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE}, 2},
+  {"WiFi & Updates", {MORE_ACTION_WIFI, MORE_ACTION_UPDATE}, 2},
+  {"Storage",        {MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES}, 3},
+  {"System",         {MORE_ACTION_ABOUT, MORE_ACTION_RUN_SETUP}, 2},
+  {"Games",          {MORE_ACTION_SNAKE}, 1},
+};
+const int settingsCategoryCount = sizeof(settingsCategories) / sizeof(settingsCategories[0]);
+int settingsCategory = -1;
 
 // ---- Home screen tile layout: 2 columns x 3 rows (portrait). Slot 0
 // (top-left) is a live status widget, not a launcher -- slots 1-5 are
@@ -971,7 +1097,7 @@ void drawKeyboardScreen() {
   if (kbContext == KB_CONTEXT_WIFI_PASSWORD) title = "WiFi Password";
   drawBackBar(title);
 
-  tft.fillRoundRect(10, 30, 220, 40, 12, ILI9341_WHITE);
+  tft.fillRoundRect(10, 30, 220, 40, 12, COLOR_SURFACE);
   tft.drawRoundRect(10, 30, 220, 40, 12, COLOR_SUBTEXT);
   tft.setTextColor(COLOR_TEXT);
   tft.setTextSize(2);
@@ -1422,7 +1548,7 @@ void handleHomeTouch(int x, int y) {
         currentScreen = SCREEN_WEATHER;
         drawWeatherScreen();
       } else {
-        settingsPage = 0;
+        settingsCategory = -1;
         currentScreen = SCREEN_SETTINGS;
         drawSettingsScreen();
       }
@@ -1772,7 +1898,7 @@ bool touchedNotesClear(int x, int y) { return x >= 4 && x <= 114 && y >= 32 && y
 bool touchedNotesSave(int x, int y) { return x >= 126 && x <= 236 && y >= 32 && y <= 54; }
 
 void drawNotesCanvasArea() {
-  tft.fillRect(0, 58, 240, 320 - 58, ILI9341_WHITE);
+  tft.fillRect(0, 58, 240, 320 - 58, COLOR_SURFACE);
 }
 
 void saveNotesToFile() {
@@ -2190,7 +2316,7 @@ void drawSnakeScore() {
 }
 
 void drawSnakeField() {
-  tft.fillRect(snakeFieldX, snakeFieldY, snakeFieldW, snakeFieldH, ILI9341_WHITE);
+  tft.fillRect(snakeFieldX, snakeFieldY, snakeFieldW, snakeFieldH, COLOR_SURFACE);
   tft.drawRect(snakeFieldX - 1, snakeFieldY - 1, snakeFieldW + 2, snakeFieldH + 2, COLOR_SUBTEXT);
 
   tft.fillRect(snakeFieldX + snakeFoodX * SNAKE_CELL + 1, snakeFieldY + snakeFoodY * SNAKE_CELL + 1,
@@ -2596,88 +2722,93 @@ void handleOtaTouch(int x, int y) {
 }
 
 // ============================================================
-// UI: SETTINGS -- a paged list. Set Time / Set Date / WiFi live here
-// alongside everything that used to be on its own "More" tile (About,
-// the clear-data actions, first-time setup, Snake), 4 rows per page
-// with Prev/Next paging when there's more than one page.
+// UI: SETTINGS -- two levels. The top level lists categories
+// (Appearance, Time & Date, WiFi & Updates, Storage, System, Games);
+// tapping one opens its buttons. Back goes up a level, then Home.
 // ============================================================
+uint16_t settingsCategoryColor(int c) {
+  switch (c) {
+    case 0: return COLOR_NOTES;
+    case 1: return COLOR_TODO;
+    case 2: return COLOR_BLUE;
+    case 3: return COLOR_WEATHER;
+    case 4: return COLOR_SETTINGS;
+    default: return COLOR_HOMEWORK;
+  }
+}
+
+const char* moreItemName(MoreAction a) {
+  for (int i = 0; i < moreItemCount; i++)
+    if (moreItems[i].action == a) return moreItems[i].name;
+  return "";
+}
+
+uint16_t moreItemColor(MoreAction a) {
+  if (a == MORE_ACTION_UPDATE) return COLOR_BLUE;
+  if (a == MORE_ACTION_CLEAR_TODO || a == MORE_ACTION_CLEAR_HOMEWORK || a == MORE_ACTION_CLEAR_NOTES)
+    return COLOR_ERROR;
+  return COLOR_SETTINGS;
+}
+
 void drawSettingsScreen() {
   tft.fillScreen(COLOR_BG);
   drawScreenFrame();
-  drawBackBar("Settings");
 
-  int startIdx = settingsPage * SETTINGS_ITEMS_PER_PAGE;
-  int endIdx = startIdx + SETTINGS_ITEMS_PER_PAGE;
-  if (endIdx > moreItemCount) endIdx = moreItemCount;
-
-  int row = 0;
-  for (int i = startIdx; i < endIdx; i++) {
-    int rowY = 34 + row * 48;
-    bool safeAction = (moreItems[i].action == MORE_ACTION_ABOUT ||
-                        moreItems[i].action == MORE_ACTION_UPDATE ||
-                        moreItems[i].action == MORE_ACTION_RUN_SETUP ||
-                        moreItems[i].action == MORE_ACTION_SNAKE ||
-                        moreItems[i].action == MORE_ACTION_SET_TIME ||
-                        moreItems[i].action == MORE_ACTION_SET_DATE ||
-                        moreItems[i].action == MORE_ACTION_WIFI ||
-                        moreItems[i].action == MORE_ACTION_ANIMATIONS ||
-                        moreItems[i].action == MORE_ACTION_WIDGET);
-    uint16_t color = safeAction ? COLOR_SETTINGS : COLOR_ERROR;
-    if (moreItems[i].action == MORE_ACTION_UPDATE) color = COLOR_BLUE;
-    drawGlassRect(20, rowY, 200, 40, 18, color);
-    const char* label = moreItems[i].name;
-    if (moreItems[i].action == MORE_ACTION_ANIMATIONS)
-      label = homeAnimationsEnabled ? "Animations: On" : "Animations: Off";
-    char widgetLabel[32];
-    if (moreItems[i].action == MORE_ACTION_WIDGET) {
-      snprintf(widgetLabel, sizeof(widgetLabel), "Widget: %s", widgetNames[homeWidget]);
-      label = widgetLabel;
+  if (settingsCategory < 0) {
+    drawBackBar("Settings");
+    for (int c = 0; c < settingsCategoryCount; c++) {
+      int rowY = 32 + c * 46;
+      drawGlassRect(20, rowY, 200, 40, 18, settingsCategoryColor(c));
+      printFitted(&FreeSansBold12pt7b, 114, rowY + 12, settingsCategories[c].name, ILI9341_WHITE, 170);
+      tft.setFont();
+      tft.setTextSize(2);
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setCursor(196, rowY + 13);
+      tft.print(">");
+      tft.setTextSize(1);
     }
-    printFitted(&FreeSansBold12pt7b, 120, rowY + 12, label, ILI9341_WHITE, 188);
-    row++;
+    return;
   }
 
-  int totalPages = (moreItemCount + SETTINGS_ITEMS_PER_PAGE - 1) / SETTINGS_ITEMS_PER_PAGE;
-  if (totalPages > 1) {
-    drawGlassRect(20, 270, 80, 36, 16, COLOR_SUBTEXT);
-    printFitted(&FreeSansBold12pt7b, 60, 282, "< Prev", ILI9341_WHITE, 70);
+  SettingsCategory& cat = settingsCategories[settingsCategory];
+  drawBackBar(cat.name);
+  for (int i = 0; i < cat.count; i++) {
+    int rowY = 40 + i * 52;
+    MoreAction action = cat.items[i];
+    drawGlassRect(20, rowY, 200, 44, 18, moreItemColor(action));
 
-    char pageBuf[12];
-    sprintf(pageBuf, "%d / %d", settingsPage + 1, totalPages);
-    printCentered(&FreeSans9pt7b, 120, 283, pageBuf, COLOR_SUBTEXT);
-
-    drawGlassRect(140, 270, 80, 36, 16, COLOR_SUBTEXT);
-    printFitted(&FreeSansBold12pt7b, 180, 282, "Next >", ILI9341_WHITE, 70);
+    char label[32];
+    if (action == MORE_ACTION_ANIMATIONS) {
+      snprintf(label, sizeof(label), "Animations: %s", homeAnimationsEnabled ? "On" : "Off");
+    } else if (action == MORE_ACTION_WIDGET) {
+      snprintf(label, sizeof(label), "Widget: %s", widgetNames[homeWidget]);
+    } else if (action == MORE_ACTION_THEME) {
+      snprintf(label, sizeof(label), "Theme: %s", currentTheme == THEME_CUSTOM ? "Custom" : themes[currentTheme].name);
+    } else {
+      snprintf(label, sizeof(label), "%s", moreItemName(action));
+    }
+    printFitted(&FreeSansBold12pt7b, 120, rowY + 14, label, ILI9341_WHITE, 188);
   }
 }
 
 void handleSettingsTouch(int x, int y) {
-  int totalPages = (moreItemCount + SETTINGS_ITEMS_PER_PAGE - 1) / SETTINGS_ITEMS_PER_PAGE;
-
-  if (totalPages > 1 && y >= 270 && y <= 306) {
-    if (x >= 20 && x <= 100) { // Prev
-      settingsPage--;
-      if (settingsPage < 0) settingsPage = totalPages - 1;
-      drawSettingsScreen();
-      return;
+  if (settingsCategory < 0) {
+    for (int c = 0; c < settingsCategoryCount; c++) {
+      int rowY = 32 + c * 46;
+      if (x >= 20 && x <= 220 && y >= rowY && y <= rowY + 40) {
+        settingsCategory = c;
+        drawSettingsScreen();
+        return;
+      }
     }
-    if (x >= 140 && x <= 220) { // Next
-      settingsPage++;
-      if (settingsPage >= totalPages) settingsPage = 0;
-      drawSettingsScreen();
-      return;
-    }
+    return;
   }
 
-  int startIdx = settingsPage * SETTINGS_ITEMS_PER_PAGE;
-  int endIdx = startIdx + SETTINGS_ITEMS_PER_PAGE;
-  if (endIdx > moreItemCount) endIdx = moreItemCount;
-
-  int row = 0;
-  for (int i = startIdx; i < endIdx; i++) {
-    int rowY = 34 + row * 48;
-    if (x >= 20 && x <= 220 && y >= rowY && y <= rowY + 40) {
-      MoreAction action = moreItems[i].action;
+  SettingsCategory& cat = settingsCategories[settingsCategory];
+  for (int i = 0; i < cat.count; i++) {
+    int rowY = 40 + i * 52;
+    if (x >= 20 && x <= 220 && y >= rowY && y <= rowY + 44) {
+      MoreAction action = cat.items[i];
       if (action == MORE_ACTION_SET_TIME) {
         DateTime now = rtc.now();
         editHour = now.hour();
@@ -2702,6 +2833,9 @@ void handleSettingsTouch(int x, int y) {
         homeWidget = (homeWidget + 1) % WIDGET_COUNT;
         saveHomeWidget(homeWidget);
         drawSettingsScreen();
+      } else if (action == MORE_ACTION_THEME) {
+        currentScreen = SCREEN_THEMES;
+        drawThemesScreen();
       } else if (action == MORE_ACTION_ABOUT) {
         currentScreen = SCREEN_MORE_ABOUT;
         drawMoreAboutScreen();
@@ -2729,7 +2863,124 @@ void handleSettingsTouch(int x, int y) {
       }
       return;
     }
-    row++;
+  }
+}
+
+// ============================================================
+// UI: THEMES -- one row per theme with a little palette preview. Tapping
+// a preset applies it everywhere immediately; "Custom" opens the builder.
+// ============================================================
+void drawThemeSwatches(int x, int y, RGB bg, RGB accent, RGB bar, RGB tile) {
+  tft.fillRect(x,      y, 12, 20, rgb565(bg));
+  tft.fillRect(x + 12, y, 12, 20, rgb565(bar));
+  tft.fillRect(x + 24, y, 12, 20, rgb565(accent));
+  tft.fillRect(x + 36, y, 12, 20, rgb565(tile));
+  tft.drawRect(x - 1, y - 1, 50, 22, COLOR_SUBTEXT);
+}
+
+void drawThemesScreen() {
+  tft.fillScreen(COLOR_BG);
+  drawScreenFrame();
+  drawBackBar("Theme");
+
+  for (int i = 0; i < themeCount; i++) {
+    int rowY = 30 + i * 40;
+    bool selected = (i == currentTheme);
+    drawGlassRect(12, rowY, 216, 34, 14, selected ? COLOR_ACCENT : COLOR_SURFACE);
+
+    if (i == THEME_CUSTOM) {
+      Theme base = themes[customBase == 1 ? 1 : 0];
+      RGB a = customAccents[customAccent];
+      drawThemeSwatches(22, rowY + 7, base.bg, a, darkenRGB(a, 40), base.todo);
+    } else {
+      drawThemeSwatches(22, rowY + 7, themes[i].bg, themes[i].accent, themes[i].statusbar, themes[i].todo);
+    }
+
+    const char* name = (i == THEME_CUSTOM) ? "Custom >" : themes[i].name;
+    tft.setFont(&FreeSansBold12pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(selected ? ILI9341_WHITE : COLOR_TEXT);
+    tft.setCursor(84, rowY + 24);
+    tft.print(name);
+    tft.setFont();
+  }
+}
+
+void handleThemesTouch(int x, int y) {
+  for (int i = 0; i < themeCount; i++) {
+    int rowY = 30 + i * 40;
+    if (x >= 12 && x <= 228 && y >= rowY && y <= rowY + 34) {
+      if (i == THEME_CUSTOM) {
+        currentTheme = THEME_CUSTOM;
+        applyTheme(currentTheme);
+        saveThemeSettings();
+        currentScreen = SCREEN_THEME_CUSTOM;
+        drawThemeCustomScreen();
+      } else {
+        currentTheme = i;
+        applyTheme(currentTheme);
+        saveThemeSettings();
+        drawThemesScreen();
+      }
+      return;
+    }
+  }
+}
+
+// ============================================================
+// UI: CUSTOM THEME -- pick a Light/Dark base and one of 8 accents.
+// Changes apply live so you can see the result straight away.
+// ============================================================
+void drawThemeCustomScreen() {
+  tft.fillScreen(COLOR_BG);
+  drawScreenFrame();
+  drawBackBar("Custom Theme");
+
+  printCentered(&FreeSansBold12pt7b, 120, 36, "Base", COLOR_TEXT);
+  for (int b = 0; b < 2; b++) {
+    int bx = 20 + b * 104;
+    bool sel = (customBase == b);
+    drawGlassRect(bx, 64, 96, 40, 16, sel ? COLOR_ACCENT : COLOR_SURFACE);
+    printFitted(&FreeSansBold12pt7b, bx + 48, 76, customBaseNames[b], sel ? ILI9341_WHITE : COLOR_TEXT, 88);
+  }
+
+  printCentered(&FreeSansBold12pt7b, 120, 120, "Accent", COLOR_TEXT);
+  for (int i = 0; i < 8; i++) {
+    int cx = 39 + (i % 4) * 54;
+    int cy = 172 + (i / 4) * 54;
+    tft.fillCircle(cx, cy, 20, rgb565(customAccents[i]));
+    if (i == customAccent) {
+      tft.drawCircle(cx, cy, 23, COLOR_TEXT);
+      tft.drawCircle(cx, cy, 24, COLOR_TEXT);
+    }
+  }
+
+  printCentered(&FreeSans9pt7b, 120, 290, "Changes apply instantly", COLOR_SUBTEXT);
+}
+
+void handleThemeCustomTouch(int x, int y) {
+  for (int b = 0; b < 2; b++) {
+    int bx = 20 + b * 104;
+    if (x >= bx && x <= bx + 96 && y >= 64 && y <= 104) {
+      customBase = b;
+      currentTheme = THEME_CUSTOM;
+      applyTheme(currentTheme);
+      saveThemeSettings();
+      drawThemeCustomScreen();
+      return;
+    }
+  }
+  for (int i = 0; i < 8; i++) {
+    int cx = 39 + (i % 4) * 54;
+    int cy = 172 + (i / 4) * 54;
+    if (abs(x - cx) <= 26 && abs(y - cy) <= 26) {
+      customAccent = i;
+      currentTheme = THEME_CUSTOM;
+      applyTheme(currentTheme);
+      saveThemeSettings();
+      drawThemeCustomScreen();
+      return;
+    }
   }
 }
 
@@ -2911,29 +3162,8 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
 
-  COLOR_BG        = tft.color565(250, 240, 222);
-  COLOR_TEXT      = tft.color565(90, 62, 40);
-  COLOR_SUBTEXT   = tft.color565(150, 120, 90);
-  COLOR_ACCENT    = tft.color565(110, 175, 100);
-  COLOR_STATUSBAR = tft.color565(200, 150, 100);
-  COLOR_ERROR     = tft.color565(220, 100, 90);
-  COLOR_FRAME     = tft.color565(220, 195, 160);
-  COLOR_SHADOW    = tft.color565(215, 190, 165);
-  COLOR_TODO      = tft.color565(140, 200, 220);
-  COLOR_NOTES     = tft.color565(190, 160, 210);
-  COLOR_HOMEWORK  = tft.color565(140, 200, 140);
-  COLOR_WEATHER   = tft.color565(240, 180, 120);
-  COLOR_SETTINGS  = tft.color565(190, 170, 150);
-  COLOR_MORE      = tft.color565(220, 160, 170);
-  COLOR_BLUE      = tft.color565(90, 150, 220);
-  COLOR_GRAY      = tft.color565(170, 170, 170);
-
-  tileColors[0] = COLOR_MORE;      // widget tile background
-  tileColors[1] = COLOR_TODO;
-  tileColors[2] = COLOR_NOTES;
-  tileColors[3] = COLOR_HOMEWORK;
-  tileColors[4] = COLOR_WEATHER;
-  tileColors[5] = COLOR_SETTINGS;
+  loadThemeSettings();
+  applyTheme(currentTheme);
 
   connectToBestSavedNetwork();
 
@@ -3195,9 +3425,34 @@ void loop() {
       }
       break;
 
-    case SCREEN_SETTINGS:
+    case SCREEN_THEMES:
       if (justTouched) {
         if (touchedBack(touchX, touchY)) {
+          currentScreen = SCREEN_SETTINGS;
+          drawSettingsScreen();
+        } else {
+          handleThemesTouch(touchX, touchY);
+        }
+      }
+      break;
+
+    case SCREEN_THEME_CUSTOM:
+      if (justTouched) {
+        if (touchedBack(touchX, touchY)) {
+          currentScreen = SCREEN_THEMES;
+          drawThemesScreen();
+        } else {
+          handleThemeCustomTouch(touchX, touchY);
+        }
+      }
+      break;
+
+    case SCREEN_SETTINGS:
+      if (justTouched) {
+        if (touchedBack(touchX, touchY) && settingsCategory >= 0) {
+          settingsCategory = -1;
+          drawSettingsScreen();
+        } else if (touchedBack(touchX, touchY)) {
           currentScreen = SCREEN_HOME;
           drawHomeScreen(now);
           lastDrawnMinute = now.minute();
