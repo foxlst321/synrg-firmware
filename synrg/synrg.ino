@@ -50,7 +50,7 @@
 
 // Settings actions -- declared up here so the Arduino IDE's auto-generated
 // function prototypes can see the type.
-enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME };
+enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME, MORE_ACTION_DEVICE_NAME };
 
 // Theme palette types (see the THEMES block further down).
 struct RGB { uint8_t r, g, b; };
@@ -60,7 +60,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v2.2"
+#define FIRMWARE_VERSION "v2.3"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -194,6 +194,47 @@ void loadThemeSettings() {
   customAccent = (a >= 0 && a < 8) ? a : 0;
 }
 
+// ---- Device name: chosen during first-time setup (or Settings > System >
+// Device Name). Shown on the web page and used as the WiFi hostname.
+// Saved to /name.txt. ----
+#define DEVICE_NAME_MAX 20
+char deviceName[DEVICE_NAME_MAX + 1] = "SynRG";
+
+void loadDeviceName() {
+  if (!LittleFS.exists("/name.txt")) return;
+  File f = LittleFS.open("/name.txt");
+  if (!f) return;
+  char buf[DEVICE_NAME_MAX + 1];
+  int i = 0;
+  while (f.available() && i < DEVICE_NAME_MAX) {
+    char c = f.read();
+    if (c == '\n' || c == '\r') break;
+    buf[i++] = c;
+  }
+  buf[i] = '\0';
+  f.close();
+  if (i > 0) strcpy(deviceName, buf);
+}
+
+void saveDeviceName() {
+  LittleFS.remove("/name.txt");
+  File f = LittleFS.open("/name.txt", FILE_WRITE);
+  if (f) { f.print(deviceName); f.close(); }
+}
+
+// WiFi hostnames may only use letters, digits and dashes.
+void buildHostname(char* out, size_t len) {
+  size_t j = 0;
+  for (size_t i = 0; deviceName[i] && j < len - 1; i++) {
+    char c = deviceName[i];
+    if (isalnum((unsigned char)c)) out[j++] = tolower((unsigned char)c);
+    else if ((c == ' ' || c == '-' || c == '_') && j > 0 && out[j - 1] != '-') out[j++] = '-';
+  }
+  while (j > 0 && out[j - 1] == '-') j--;
+  out[j] = '\0';
+  if (j == 0) snprintf(out, len, "synrg");
+}
+
 void saveThemeSettings() {
   LittleFS.remove("/theme.txt");
   File f = LittleFS.open("/theme.txt", FILE_WRITE);
@@ -256,7 +297,7 @@ RGB darkenRGB(RGB c, int amt) {
 // Loads a theme into the global palette. Custom = the Light (Nook) or Dark
 // (Midnight) base with the chosen accent, and a darker shade of that accent
 // for the status bar.
-void applyTheme(int idx) {
+Theme themeFor(int idx) {
   Theme t = themes[0];
   if (idx == THEME_CUSTOM) {
     t = themes[customBase == 1 ? 1 : 0];
@@ -266,6 +307,11 @@ void applyTheme(int idx) {
   } else if (idx >= 0 && idx < presetThemeCount) {
     t = themes[idx];
   }
+  return t;
+}
+
+void applyTheme(int idx) {
+  Theme t = themeFor(idx);
   COLOR_BG        = rgb565(t.bg);
   COLOR_TEXT      = rgb565(t.text);
   COLOR_SUBTEXT   = rgb565(t.subtext);
@@ -345,7 +391,7 @@ bool storageOK = false;
 bool rtcOK = false;
 
 // ---- Onscreen keyboard state (shared widget) ----
-enum KeyboardContext { KB_CONTEXT_NONE, KB_CONTEXT_ADD_TODO, KB_CONTEXT_ADD_HOMEWORK, KB_CONTEXT_WIFI_PASSWORD };
+enum KeyboardContext { KB_CONTEXT_NONE, KB_CONTEXT_ADD_TODO, KB_CONTEXT_ADD_HOMEWORK, KB_CONTEXT_WIFI_PASSWORD, KB_CONTEXT_DEVICE_NAME };
 KeyboardContext kbContext = KB_CONTEXT_NONE;
 // Three pages: letters, numbers + common symbols, and fancy symbols.
 enum KeyboardMode { KB_MODE_ABC, KB_MODE_123, KB_MODE_SYM };
@@ -443,6 +489,7 @@ MoreItem moreItems[] = {
   {"Animations",           MORE_ACTION_ANIMATIONS},
   {"Home Widget",          MORE_ACTION_WIDGET},
   {"Theme",                MORE_ACTION_THEME},
+  {"Device Name",          MORE_ACTION_DEVICE_NAME},
   {"About",                MORE_ACTION_ABOUT},
   {"Update Firmware",      MORE_ACTION_UPDATE},
   {"Clear To-Do List",     MORE_ACTION_CLEAR_TODO},
@@ -466,7 +513,7 @@ SettingsCategory settingsCategories[] = {
   {"Time & Date",    {MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE}, 2},
   {"WiFi & Updates", {MORE_ACTION_WIFI, MORE_ACTION_UPDATE}, 2},
   {"Storage",        {MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES}, 3},
-  {"System",         {MORE_ACTION_ABOUT, MORE_ACTION_RUN_SETUP}, 2},
+  {"System",         {MORE_ACTION_ABOUT, MORE_ACTION_DEVICE_NAME, MORE_ACTION_RUN_SETUP}, 3},
   {"Games",          {MORE_ACTION_SNAKE}, 1},
 };
 const int settingsCategoryCount = sizeof(settingsCategories) / sizeof(settingsCategories[0]);
@@ -768,21 +815,52 @@ int hourTo24(int h12, bool pm) { int h = h12 % 12; if (pm) h += 12; return h; }
 // ============================================================
 // WEB SERVER — view/add/delete To-Do and Homework from any browser
 // ============================================================
+String cssColor(RGB c) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "#%02x%02x%02x", c.r, c.g, c.b);
+  return String(buf);
+}
+
+String htmlEscape(const char* in) {
+  String out;
+  for (; *in; in++) {
+    switch (*in) {
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '&': out += "&amp;"; break;
+      case '\'': out += "&#39;"; break;
+      case '"': out += "&quot;"; break;
+      default: out += *in;
+    }
+  }
+  return out;
+}
+
 void handleWebRoot() {
   DateTime now = rtc.now();
   char timeStr[9];
   formatTime12h(timeStr, now.hour(), now.minute());
 
-  String html = "<!DOCTYPE html><html><head><title>PDA</title>";
+  // The page follows the PDA's current theme, so it matches the screen.
+  Theme t = themeFor(currentTheme);
+  String bg = cssColor(t.bg), text = cssColor(t.text), sub = cssColor(t.subtext);
+  String accent = cssColor(t.accent), bar = cssColor(t.statusbar), err = cssColor(t.error);
+  String frame = cssColor(t.frame), surface = cssColor(t.surface);
+  String name = htmlEscape(deviceName);
+
+  String html = "<!DOCTYPE html><html><head><title>" + name + "</title>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<style>body{font-family:sans-serif;background:#faf0de;color:#5a3e28;max-width:500px;margin:20px auto;padding:0 16px;}";
-  html += "h1{color:#5a3e28;} h2{color:#8cc88c;border-bottom:2px solid #eee;padding-bottom:4px;}";
+  html += "<meta name='theme-color' content='" + bar + "'>";
+  html += "<style>body{font-family:sans-serif;background:" + bg + ";color:" + text + ";max-width:500px;margin:0 auto;padding:0 16px 20px;}";
+  html += "header{background:" + bar + ";color:#fff;margin:0 -16px 16px;padding:14px 16px;border-radius:0 0 14px 14px;}";
+  html += "header h1{margin:0;font-size:1.5em;} header p{margin:4px 0 0;opacity:.85;}";
+  html += "h2{color:" + accent + ";border-bottom:2px solid " + frame + ";padding-bottom:4px;}";
   html += "li{margin:6px 0;display:flex;justify-content:space-between;align-items:center;gap:8px;}";
-  html += ".delform{display:inline;} .delbtn{background:#dc6455;color:white;border:none;padding:3px 8px;border-radius:6px;cursor:pointer;font-size:0.8em;}";
-  html += "input[type=text]{padding:8px;width:70%;} input[type=submit]{padding:8px 16px;}</style>";
+  html += ".delform{display:inline;} .delbtn{background:" + err + ";color:white;border:none;padding:3px 8px;border-radius:6px;cursor:pointer;font-size:0.8em;}";
+  html += "input[type=text]{padding:8px;width:70%;background:" + surface + ";color:" + text + ";border:1px solid " + sub + ";border-radius:8px;}";
+  html += "input[type=submit]{padding:8px 16px;background:" + accent + ";color:#fff;border:none;border-radius:8px;cursor:pointer;}</style>";
   html += "</head><body>";
-  html += "<h1>PDA Status</h1>";
-  html += "<p>Time: " + String(timeStr) + "</p>";
+  html += "<header><h1>" + name + "</h1><p>" + String(timeStr) + "</p></header>";
 
   html += "<h2>To-Do</h2><ul>";
   char line[40];
@@ -1124,6 +1202,7 @@ char hitTestKeyRow(const char* row, int x, int y, int rowY, int keyH) {
 int kbMaxLen() {
   if (kbContext == KB_CONTEXT_WIFI_PASSWORD) return 63;
   if (kbContext == KB_CONTEXT_ADD_TODO) return 35;
+  if (kbContext == KB_CONTEXT_DEVICE_NAME) return DEVICE_NAME_MAX;
   return 36;
 }
 
@@ -1132,6 +1211,7 @@ void drawKeyboardScreen() {
   const char* title = "Add Task";
   if (kbContext == KB_CONTEXT_ADD_HOMEWORK) title = "Add Homework";
   if (kbContext == KB_CONTEXT_WIFI_PASSWORD) title = "WiFi Password";
+  if (kbContext == KB_CONTEXT_DEVICE_NAME) title = "Name Your Device";
   drawBackBar(title);
 
   tft.fillRoundRect(10, 30, 220, 40, 12, COLOR_SURFACE);
@@ -1246,11 +1326,51 @@ void handleKeyboardTouch(int x, int y) {
       wifiConnectStartMs = millis();
       currentScreen = SCREEN_WIFI;
       drawWifiScreen();
+    } else if (kbContext == KB_CONTEXT_DEVICE_NAME) {
+      // trim spaces off both ends; keep the old name if nothing is left
+      int start = 0, end = kbBufferLen;
+      while (start < end && kbBuffer[start] == ' ') start++;
+      while (end > start && kbBuffer[end - 1] == ' ') end--;
+      if (end > start) {
+        int n = end - start;
+        if (n > DEVICE_NAME_MAX) n = DEVICE_NAME_MAX;
+        memcpy(deviceName, kbBuffer + start, n);
+        deviceName[n] = '\0';
+        saveDeviceName();
+      }
+      leaveDeviceNameEntry();
     } else {
       currentScreen = SCREEN_TODO;
       drawTodoScreen();
     }
     return;
+  }
+}
+
+// Opens the keyboard pre-filled with the current device name.
+void startDeviceNameEntry() {
+  strncpy(kbBuffer, deviceName, sizeof(kbBuffer) - 1);
+  kbBuffer[sizeof(kbBuffer) - 1] = '\0';
+  kbBufferLen = strlen(kbBuffer);
+  kbMode = KB_MODE_ABC;
+  kbShift = false;
+  kbContext = KB_CONTEXT_DEVICE_NAME;
+  currentScreen = SCREEN_KEYBOARD;
+  drawKeyboardScreen();
+}
+
+// After naming (Done or Back): first-time setup carries on to Set Time,
+// otherwise it's back to Settings.
+void leaveDeviceNameEntry() {
+  if (firstBootFlow) {
+    DateTime now = rtc.now();
+    editHour = now.hour();
+    editMinute = now.minute();
+    currentScreen = SCREEN_SET_TIME;
+    drawSetTimeScreen();
+  } else {
+    currentScreen = SCREEN_SETTINGS;
+    drawSettingsScreen();
   }
 }
 
@@ -1374,11 +1494,7 @@ void handleTouchTestTouch(int x, int y) {
   // second tap = the Continue button, anywhere below the message is fine
   if (y > 180) {
     if (firstBootFlow) {
-      DateTime now = rtc.now();
-      editHour = now.hour();
-      editMinute = now.minute();
-      currentScreen = SCREEN_SET_TIME;
-      drawSetTimeScreen();
+      startDeviceNameEntry();
     } else {
       currentScreen = SCREEN_HOME;
       drawHomeScreen(rtc.now());
@@ -2610,6 +2726,11 @@ void drawMoreAboutScreen() {
   tft.print(wifiUp ? "Connected" : "Not connected");
 
   tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(20, 200);
+  tft.print("Name: ");
+  tft.print(deviceName);
+
+  tft.setTextColor(COLOR_TEXT);
   tft.setCursor(20, 170);
   tft.print("Time sync: ");
   if (rtcEverSynced) {
@@ -2881,6 +3002,8 @@ void drawSettingsScreen() {
       snprintf(label, sizeof(label), "Animations: %s", homeAnimationsEnabled ? "On" : "Off");
     } else if (action == MORE_ACTION_WIDGET) {
       snprintf(label, sizeof(label), "Widget: %s", widgetNames[homeWidget]);
+    } else if (action == MORE_ACTION_DEVICE_NAME) {
+      snprintf(label, sizeof(label), "Name: %s", deviceName);
     } else if (action == MORE_ACTION_THEME) {
       snprintf(label, sizeof(label), "Theme: %s", currentTheme == THEME_CUSTOM ? "Custom" : themes[currentTheme].name);
     } else {
@@ -2932,6 +3055,8 @@ void handleSettingsTouch(int x, int y) {
         homeWidget = (homeWidget + 1) % WIDGET_COUNT;
         saveHomeWidget(homeWidget);
         drawSettingsScreen();
+      } else if (action == MORE_ACTION_DEVICE_NAME) {
+        startDeviceNameEntry();
       } else if (action == MORE_ACTION_THEME) {
         currentScreen = SCREEN_THEMES;
         drawThemesScreen();
@@ -3257,8 +3382,12 @@ void setup() {
   displayRotation = loadDisplayRotation();
   homeAnimationsEnabled = loadHomeAnimations();
   homeWidget = loadHomeWidget();
+  loadDeviceName();
   tft.setRotation(displayRotation);
 
+  char hostname[33];
+  buildHostname(hostname, sizeof(hostname));
+  WiFi.setHostname(hostname);
   WiFi.mode(WIFI_STA);
   startTimeSync();
 
@@ -3445,6 +3574,8 @@ void loop() {
           } else if (kbContext == KB_CONTEXT_WIFI_PASSWORD) {
             currentScreen = SCREEN_WIFI;
             drawWifiScreen();
+          } else if (kbContext == KB_CONTEXT_DEVICE_NAME) {
+            leaveDeviceNameEntry();
           } else {
             currentScreen = SCREEN_TODO;
             drawTodoScreen();
