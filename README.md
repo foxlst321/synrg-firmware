@@ -1,4 +1,4 @@
 # synrg-firmware
 Official OTA Firmware for SynRG
 
-**Current version:** v2.1
+**Current version:** v2.2

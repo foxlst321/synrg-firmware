@@ -13,6 +13,8 @@
 #include <FS.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <time.h>
+#include <esp_sntp.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Update.h>
@@ -58,7 +60,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v2.1"
+#define FIRMWARE_VERSION "v2.2"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -299,6 +301,38 @@ const int TT_TARGET_Y = 50;
 const int TT_TARGET_R = 16;
 int currentAppIndex = -1;
 int lastDrawnMinute = -1;
+
+// ---- Automatic time sync: whenever WiFi is up, the ESP32 asks an internet
+// time server for the time (roughly once an hour) and copies it into the
+// RTC, so the clock never drifts. TIME_ZONE is US Eastern with automatic
+// daylight saving; change it here if the PDA ever moves time zones. ----
+#define TIME_ZONE "EST5EDT,M3.2.0,M11.1.0"
+volatile bool ntpFreshSync = false;   // set by the SNTP task, read in loop()
+bool rtcEverSynced = false;
+DateTime lastRtcSync;
+
+void onNtpSync(struct timeval* tv) { ntpFreshSync = true; }
+
+void startTimeSync() {
+  sntp_set_time_sync_notification_cb(onNtpSync);
+  configTzTime(TIME_ZONE, "pool.ntp.org", "time.nist.gov", "time.google.com");
+}
+
+// Called from loop(): when a fresh internet time has arrived, write it into
+// the RTC and redraw the clock on Home/Lock.
+void applyNtpToRtc() {
+  if (!ntpFreshSync) return;
+  ntpFreshSync = false;
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return;
+  if (t.tm_year + 1900 < 2024) return;   // not a real time yet
+  DateTime synced(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+  rtc.adjust(synced);
+  rtcEverSynced = true;
+  lastRtcSync = synced;
+  lastDrawnMinute = -1;   // force Home/Lock to redraw the corrected time
+  Serial.println("RTC synced from internet time.");
+}
 bool wasTouched = false;
 int editHour = 0, editMinute = 0;
 int editYear = 2026, editMonth = 1, editDay = 1;
@@ -2574,6 +2608,21 @@ void drawMoreAboutScreen() {
   bool wifiUp = (WiFi.status() == WL_CONNECTED);
   tft.setTextColor(wifiUp ? COLOR_HOMEWORK : COLOR_SUBTEXT);
   tft.print(wifiUp ? "Connected" : "Not connected");
+
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(20, 170);
+  tft.print("Time sync: ");
+  if (rtcEverSynced) {
+    char buf[24];
+    char t12[9];
+    formatTime12h(t12, lastRtcSync.hour(), lastRtcSync.minute());
+    snprintf(buf, sizeof(buf), "%02d/%02d %s", lastRtcSync.month(), lastRtcSync.day(), t12);
+    tft.setTextColor(COLOR_HOMEWORK);
+    tft.print(buf);
+  } else {
+    tft.setTextColor(COLOR_SUBTEXT);
+    tft.print(wifiUp ? "Waiting..." : "Needs WiFi");
+  }
 }
 
 // ============================================================
@@ -3211,6 +3260,7 @@ void setup() {
   tft.setRotation(displayRotation);
 
   WiFi.mode(WIFI_STA);
+  startTimeSync();
 
   loadThemeSettings();
   applyTheme(currentTheme);
@@ -3286,6 +3336,7 @@ void loop() {
 
   maybeReinitDisplay(now);
   updateIpLine();
+  applyNtpToRtc();
 
   wasTouched = touchedNow;
 
