@@ -46,7 +46,7 @@
 // D6 free (SD no longer used). D2 free but a boot strapping pin --
 // reserved for the battery voltage sensor divider once built.
 
-#define FIRMWARE_VERSION "v1.8"
+#define FIRMWARE_VERSION "v1.9"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -2623,6 +2623,7 @@ void drawSettingsScreen() {
                         moreItems[i].action == MORE_ACTION_ANIMATIONS ||
                         moreItems[i].action == MORE_ACTION_WIDGET);
     uint16_t color = safeAction ? COLOR_SETTINGS : COLOR_ERROR;
+    if (moreItems[i].action == MORE_ACTION_UPDATE) color = COLOR_BLUE;
     drawGlassRect(20, rowY, 200, 40, 18, color);
     const char* label = moreItems[i].name;
     if (moreItems[i].action == MORE_ACTION_ANIMATIONS)
