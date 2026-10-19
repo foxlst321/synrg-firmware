@@ -62,7 +62,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v2.5"
+#define FIRMWARE_VERSION "v2.6"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -164,22 +164,22 @@ void saveHomeAnimations(bool on) {
 }
 
 // Which widget the top-left Home tile shows. Cycled from Settings and saved
-// to /widget.txt so it survives a power cycle. Defaults to class status.
+// to /widget.txt so it survives a power cycle. Defaults to the clock.
 enum HomeWidget { WIDGET_CLASS, WIDGET_NEXT_CLASS, WIDGET_CLOCK, WIDGET_WEATHER, WIDGET_TODO, WIDGET_COUNT };
 const char* widgetNames[WIDGET_COUNT] = {"Class", "Next Class", "Clock", "Weather", "To-Do"};
-int homeWidget = WIDGET_CLASS;
+int homeWidget = WIDGET_CLOCK;
 
 int loadHomeWidget() {
-  if (!LittleFS.exists("/widget.txt")) return WIDGET_CLASS;
+  if (!LittleFS.exists("/widget.txt")) return WIDGET_CLOCK;
   File f = LittleFS.open("/widget.txt");
-  if (!f) return WIDGET_CLASS;
+  if (!f) return WIDGET_CLOCK;
   char buf[4];
   int i = 0;
   while (f.available() && i < 3) buf[i++] = f.read();
   buf[i] = '\0';
   f.close();
   int w = atoi(buf);
-  if (w < 0 || w >= WIDGET_COUNT) w = WIDGET_CLASS;
+  if (w < 0 || w >= WIDGET_COUNT) w = WIDGET_CLOCK;
   return w;
 }
 
@@ -1719,6 +1719,81 @@ void drawHomeStatusBar(DateTime now) {
   tft.print(timeStr);
 }
 
+// ---- Clock widget: an analog face with hour, minute and a ticking second
+// hand, plus the digital time with seconds underneath. The face is drawn
+// once; each second only the hands and digits are erased and redrawn. ----
+const int CLOCK_R = 28;
+int clockShownSecond = -1;
+int clockShownH = 0, clockShownM = 0, clockShownS = 0;
+
+int clockCX() { return tileX[0] + tileW / 2; }
+int clockCY() { return tileY[0] + 34; }
+
+void clockHandEnd(float frac, int len, int &x, int &y) {
+  float a = frac * 2 * PI - PI / 2;
+  x = clockCX() + (int)(cos(a) * len);
+  y = clockCY() + (int)(sin(a) * len);
+}
+
+void drawClockFace() {
+  int cx = clockCX(), cy = clockCY();
+  tft.fillCircle(cx, cy, CLOCK_R, COLOR_SURFACE);
+  tft.drawCircle(cx, cy, CLOCK_R, COLOR_TEXT);
+  for (int i = 0; i < 12; i++) {
+    float a = i * PI / 6;
+    int inner = (i % 3 == 0) ? CLOCK_R - 6 : CLOCK_R - 3;
+    tft.drawLine(cx + cos(a) * inner, cy + sin(a) * inner,
+                 cx + cos(a) * (CLOCK_R - 1), cy + sin(a) * (CLOCK_R - 1), COLOR_TEXT);
+  }
+}
+
+void drawClockHands(int h, int m, int sec, bool erase) {
+  int cx = clockCX(), cy = clockCY(), x, y;
+  uint16_t handColor = erase ? COLOR_SURFACE : COLOR_TEXT;
+  uint16_t secColor = erase ? COLOR_SURFACE : COLOR_ERROR;
+
+  clockHandEnd(((h % 12) + m / 60.0) / 12.0, 13, x, y);       // hour (thick)
+  tft.drawLine(cx, cy, x, y, handColor);
+  tft.drawLine(cx + 1, cy, x + 1, y, handColor);
+  tft.drawLine(cx, cy + 1, x, y + 1, handColor);
+
+  clockHandEnd((m + sec / 60.0) / 60.0, 19, x, y);            // minute
+  tft.drawLine(cx, cy, x, y, handColor);
+  tft.drawLine(cx + 1, cy, x + 1, y, handColor);
+
+  clockHandEnd(sec / 60.0, 21, x, y);                         // second
+  tft.drawLine(cx, cy, x, y, secColor);
+
+  if (!erase) tft.fillCircle(cx, cy, 2, COLOR_ERROR);
+}
+
+// Called every loop() on Home; does nothing unless the Clock widget is
+// showing and the second has changed.
+void updateClockWidget(DateTime now) {
+  if (homeWidget != WIDGET_CLOCK) return;
+  if (now.second() == clockShownSecond) return;
+
+  if (clockShownSecond >= 0) drawClockHands(clockShownH, clockShownM, clockShownS, true);
+  drawClockHands(now.hour(), now.minute(), now.second(), false);
+  clockShownH = now.hour(); clockShownM = now.minute(); clockShownS = now.second();
+  clockShownSecond = now.second();
+
+  // digital time with seconds, under the face
+  int dh = now.hour() % 12;
+  if (dh == 0) dh = 12;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d:%02d:%02d %s", dh, now.minute(), now.second(), now.hour() < 12 ? "AM" : "PM");
+  int ty = tileY[0] + tileH - 14;
+  tft.fillRect(tileX[0] + 6, ty - 1, tileW - 12, 10, tileColors[0]);
+  tft.setFont();
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+  int16_t x1, y1; uint16_t tw, th;
+  tft.getTextBounds(buf, 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor(clockCX() - tw / 2, ty);
+  tft.print(buf);
+}
+
 // Slot 0 (top-left) is a live widget rather than an app launcher. Which
 // widget it shows is picked in Settings ("Widget: ..."); it's refreshed
 // every minute along with the rest of the Home screen. Tapping it does
@@ -1765,11 +1840,10 @@ void drawWidgetTile() {
       break;
     }
     case WIDGET_CLOCK:
-      formatTime12h(buf, now.hour(), now.minute());
-      printFitted(&FreeSansBold12pt7b, tileX[0] + tileW / 2, y + 26, buf, ILI9341_WHITE, tileW - 12);
-      tft.setTextColor(ILI9341_WHITE);
-      tft.setTextSize(1);
-      break;
+      drawClockFace();
+      clockShownSecond = -1;     // force hands + digital time to draw now
+      updateClockWidget(now);
+      return;                    // the clock draws its own label (digital time)
     case WIDGET_WEATHER:
       printFitted(&FreeSansBold12pt7b, tileX[0] + tileW / 2, y + 22, weatherTemp, ILI9341_WHITE, tileW - 12);
       tft.setTextColor(ILI9341_WHITE);
@@ -3694,6 +3768,7 @@ void loop() {
 
   if (currentScreen == SCREEN_HOME) {
     updateHomeAnimations();
+    updateClockWidget(now);
   }
 
   maybeReinitDisplay(now);
