@@ -50,7 +50,9 @@
 
 // Settings actions -- declared up here so the Arduino IDE's auto-generated
 // function prototypes can see the type.
-enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME, MORE_ACTION_DEVICE_NAME };
+enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM, SCREEN_TOUCH_CAL };
+enum SnakeDir { SNAKE_UP, SNAKE_DOWN, SNAKE_LEFT, SNAKE_RIGHT };
+enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME, MORE_ACTION_DEVICE_NAME, MORE_ACTION_TOUCH_CAL };
 
 // Theme palette types (see the THEMES block further down).
 struct RGB { uint8_t r, g, b; };
@@ -60,7 +62,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v2.3"
+#define FIRMWARE_VERSION "v2.5"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -99,6 +101,47 @@ void saveDisplayRotation(int r) {
   LittleFS.remove("/display.txt");
   File f = LittleFS.open("/display.txt", FILE_WRITE);
   if (f) { f.print(r); f.close(); }
+}
+
+// ---- Touch calibration (Settings > System > Calibrate Touch, the web
+// page, or hold the screen for 6 seconds). Three taps tell us which raw
+// touch axis runs which way -- normal, mirrored, or swapped -- so a panel
+// that reads in the wrong direction still lines up with the picture.
+// Saved to /touch.txt as "swap,x0,x1,y0,y1,rotation"; without that file the
+// original fixed mapping is used. ----
+bool touchCalValid = false;
+bool touchCalSwap = false;      // raw X/Y swapped relative to the screen
+int touchCalX0, touchCalX1;     // raw readings at screen x = CAL_X0 / CAL_X1
+int touchCalY0, touchCalY1;     // raw readings at screen y = CAL_Y0 / CAL_Y1
+int touchCalRotation = DISPLAY_ROTATION;
+const int CAL_X0 = 24, CAL_X1 = 216, CAL_Y0 = 40, CAL_Y1 = 296;
+
+void loadTouchCal() {
+  touchCalValid = false;
+  if (!LittleFS.exists("/touch.txt")) return;
+  File f = LittleFS.open("/touch.txt");
+  if (!f) return;
+  char buf[48];
+  int i = 0;
+  while (f.available() && i < 47) buf[i++] = f.read();
+  buf[i] = '\0';
+  f.close();
+  int sw, x0, x1, y0, y1, rot;
+  if (sscanf(buf, "%d,%d,%d,%d,%d,%d", &sw, &x0, &x1, &y0, &y1, &rot) != 6) return;
+  if (abs(x1 - x0) < 300 || abs(y1 - y0) < 300) return;
+  touchCalSwap = (sw == 1);
+  touchCalX0 = x0; touchCalX1 = x1; touchCalY0 = y0; touchCalY1 = y1;
+  touchCalRotation = rot;
+  touchCalValid = true;
+}
+
+void saveTouchCal() {
+  LittleFS.remove("/touch.txt");
+  File f = LittleFS.open("/touch.txt", FILE_WRITE);
+  if (f) {
+    f.printf("%d,%d,%d,%d,%d,%d", touchCalSwap ? 1 : 0, touchCalX0, touchCalX1, touchCalY0, touchCalY1, touchCalRotation);
+    f.close();
+  }
 }
 
 // Home screen icon "breathing" animation on/off. Toggled from Settings and
@@ -338,7 +381,6 @@ void applyTheme(int idx) {
   tileColors[5] = COLOR_SETTINGS;
 }
 
-enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM };
 Screen currentScreen = SCREEN_LOCK;
 bool firstBootFlow = false;   // true while walking through welcome -> touch test -> set time -> set date
 int touchTestResult = 0;      // 0 = waiting for tap, 1 = pass, 2 = fail (mirrored)
@@ -380,6 +422,7 @@ void applyNtpToRtc() {
   Serial.println("RTC synced from internet time.");
 }
 bool wasTouched = false;
+unsigned long touchHoldStartMs = 0;
 int editHour = 0, editMinute = 0;
 int editYear = 2026, editMonth = 1, editDay = 1;
 unsigned long lastAnimMs = 0;
@@ -473,7 +516,6 @@ char otaMsg[40] = "";
 // section, because the Arduino IDE auto-generates function prototypes near
 // the top of the file, and a prototype using this type would otherwise
 // reference it before it exists) ----
-enum SnakeDir { SNAKE_UP, SNAKE_DOWN, SNAKE_LEFT, SNAKE_RIGHT };
 
 // ---- Settings list: everything that used to live on its own "More" tile
 // is now folded into the Settings screen as a scrollable/paged registry,
@@ -490,6 +532,7 @@ MoreItem moreItems[] = {
   {"Home Widget",          MORE_ACTION_WIDGET},
   {"Theme",                MORE_ACTION_THEME},
   {"Device Name",          MORE_ACTION_DEVICE_NAME},
+  {"Calibrate Touch",      MORE_ACTION_TOUCH_CAL},
   {"About",                MORE_ACTION_ABOUT},
   {"Update Firmware",      MORE_ACTION_UPDATE},
   {"Clear To-Do List",     MORE_ACTION_CLEAR_TODO},
@@ -505,7 +548,7 @@ MoreAction pendingConfirmAction;
 // category. settingsCategory == -1 means the top-level category list.
 struct SettingsCategory {
   const char* name;
-  MoreAction items[3];
+  MoreAction items[4];
   int count;
 };
 SettingsCategory settingsCategories[] = {
@@ -513,7 +556,7 @@ SettingsCategory settingsCategories[] = {
   {"Time & Date",    {MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE}, 2},
   {"WiFi & Updates", {MORE_ACTION_WIFI, MORE_ACTION_UPDATE}, 2},
   {"Storage",        {MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES}, 3},
-  {"System",         {MORE_ACTION_ABOUT, MORE_ACTION_DEVICE_NAME, MORE_ACTION_RUN_SETUP}, 3},
+  {"System",         {MORE_ACTION_ABOUT, MORE_ACTION_DEVICE_NAME, MORE_ACTION_TOUCH_CAL, MORE_ACTION_RUN_SETUP}, 4},
   {"Games",          {MORE_ACTION_SNAKE}, 1},
 };
 const int settingsCategoryCount = sizeof(settingsCategories) / sizeof(settingsCategories[0]);
@@ -903,6 +946,11 @@ void handleWebRoot() {
   html += "<form action='/addhomework' method='GET'><input type='text' name='text' placeholder='New homework item'>";
   html += "<input type='submit' value='Add Homework'></form>";
 
+  html += "<h2>Device</h2><p>" + String(FIRMWARE_VERSION) + "</p>";
+  html += "<form action='/calibrate' method='GET' style='display:inline'><input type='submit' value='Calibrate Touch'></form> ";
+  html += "<form action='/update' method='GET' style='display:inline'><input type='submit' value='Check for Update'></form> ";
+  html += "<form action='/restart' method='GET' style='display:inline' onsubmit=\"return confirm('Restart the PDA?')\"><input type='submit' value='Restart'></form>";
+
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -951,6 +999,53 @@ void handleWebDeleteHomework() {
   }
   server.sendHeader("Location", "/");
   server.send(303);
+}
+
+// ---- Device controls on the web page, so the PDA can still be calibrated,
+// updated or restarted when its touch isn't working. The heavy work runs in
+// loop() after the browser has had its reply. ----
+bool webCalRequested = false;
+bool webOtaRequested = false;
+unsigned long webRestartAtMs = 0;
+
+void sendWebMessage(const char* msg) {
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='8;url=/'><title>" + htmlEscape(deviceName) + "</title></head>";
+  html += "<body style='font-family:sans-serif;max-width:500px;margin:40px auto;padding:0 16px;'>";
+  html += "<p>" + String(msg) + "</p><p><a href='/'>Back</a></p></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleWebCalibrate() {
+  webCalRequested = true;
+  sendWebMessage("Touch calibration started -- tap the three targets on the PDA screen.");
+}
+
+void handleWebUpdate() {
+  webOtaRequested = true;
+  sendWebMessage("Checking for an update -- watch the PDA screen. If one is found it installs and restarts.");
+}
+
+void handleWebRestart() {
+  webRestartAtMs = millis() + 500;
+  sendWebMessage("Restarting the PDA...");
+}
+
+void runWebRequests() {
+  if (webCalRequested) {
+    webCalRequested = false;
+    startTouchCalibration(SCREEN_HOME);
+  }
+  if (webOtaRequested) {
+    webOtaRequested = false;
+    otaState = OTA_IDLE;
+    otaLatest[0] = '\0';
+    otaMsg[0] = '\0';
+    currentScreen = SCREEN_OTA;
+    checkOtaVersion();
+    if (otaState == OTA_AVAILABLE) performOtaUpdate();
+  }
+  if (webRestartAtMs && millis() > webRestartAtMs) ESP.restart();
 }
 
 // ============================================================
@@ -3057,6 +3152,8 @@ void handleSettingsTouch(int x, int y) {
         drawSettingsScreen();
       } else if (action == MORE_ACTION_DEVICE_NAME) {
         startDeviceNameEntry();
+      } else if (action == MORE_ACTION_TOUCH_CAL) {
+        startTouchCalibration(SCREEN_SETTINGS);
       } else if (action == MORE_ACTION_THEME) {
         currentScreen = SCREEN_THEMES;
         drawThemesScreen();
@@ -3353,6 +3450,123 @@ void handleSetDateTouch(int x, int y) {
 }
 
 // ============================================================
+// UI: TOUCH CALIBRATION -- tap three crosshairs (top-left, top-right,
+// bottom-left). Uses raw touch readings, so it works even when touch is
+// currently pointing the wrong way.
+// ============================================================
+int touchCalStep = 0;           // 0-2 = waiting for crosshair n, 3 = done, 4 = failed
+TS_Point touchCalRaw[3];
+Screen touchCalReturn = SCREEN_HOME;
+
+const int calTargetX[3] = {CAL_X0, CAL_X1, CAL_X0};
+const int calTargetY[3] = {CAL_Y0, CAL_Y0, CAL_Y1};
+
+void drawCrosshair(int x, int y, uint16_t c) {
+  tft.drawLine(x - 12, y, x + 12, y, c);
+  tft.drawLine(x, y - 12, x, y + 12, c);
+  tft.drawCircle(x, y, 7, c);
+}
+
+void drawTouchCalScreen() {
+  tft.fillScreen(COLOR_BG);
+  drawScreenFrame();
+
+  if (touchCalStep < 3) {
+    printCentered(&FreeSansBold12pt7b, 120, 120, "Calibrate Touch", COLOR_TEXT);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Tap the target (%d of 3)", touchCalStep + 1);
+    printCentered(&FreeSans9pt7b, 120, 156, buf, COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 180, "Use a fingernail or stylus", COLOR_SUBTEXT);
+    drawCrosshair(calTargetX[touchCalStep], calTargetY[touchCalStep], COLOR_ERROR);
+    return;
+  }
+
+  if (touchCalStep == 3) {
+    printCentered(&FreeSansBold12pt7b, 120, 60, "Touch calibrated!", COLOR_HOMEWORK);
+    printCentered(&FreeSans9pt7b, 120, 96, "Tap around to test it", COLOR_SUBTEXT);
+  } else {
+    printCentered(&FreeSansBold12pt7b, 120, 60, "That didn't work", COLOR_ERROR);
+    printCentered(&FreeSans9pt7b, 120, 96, "Old touch settings kept", COLOR_SUBTEXT);
+  }
+  drawGlassRect(20, 250, 96, 44, 16, COLOR_SETTINGS);
+  printFitted(&FreeSansBold12pt7b, 68, 264, "Redo", ILI9341_WHITE, 86);
+  drawGlassRect(124, 250, 96, 44, 16, COLOR_ACCENT);
+  printFitted(&FreeSansBold12pt7b, 172, 264, "Done", ILI9341_WHITE, 86);
+}
+
+void startTouchCalibration(Screen returnTo) {
+  touchCalReturn = returnTo;
+  touchCalStep = 0;
+  currentScreen = SCREEN_TOUCH_CAL;
+  drawTouchCalScreen();
+}
+
+void leaveTouchCalibration() {
+  if (touchCalReturn == SCREEN_SETTINGS) {
+    currentScreen = SCREEN_SETTINGS;
+    drawSettingsScreen();
+  } else {
+    currentScreen = SCREEN_HOME;
+    drawHomeScreen(rtc.now());
+    lastDrawnMinute = rtc.now().minute();
+  }
+}
+
+// Average a few raw readings while the finger is down.
+TS_Point readRawTouchAveraged() {
+  long sx = 0, sy = 0;
+  int n = 0;
+  for (int i = 0; i < 8 && ts.touched(); i++) {
+    TS_Point p = ts.getPoint();
+    sx += p.x; sy += p.y; n++;
+    delay(5);
+  }
+  TS_Point out;
+  if (n == 0) { out = ts.getPoint(); return out; }
+  out.x = sx / n; out.y = sy / n; out.z = 1;
+  return out;
+}
+
+void finishTouchCalibration() {
+  TS_Point a = touchCalRaw[0], b = touchCalRaw[1], c = touchCalRaw[2];
+  // a -> b moves only across the screen; whichever raw axis changed most
+  // there is the screen's X axis.
+  bool swap = abs(b.y - a.y) > abs(b.x - a.x);
+  int x0 = swap ? a.y : a.x, x1 = swap ? b.y : b.x;
+  int y0 = swap ? a.x : a.y, y1 = swap ? c.x : c.y;
+  if (abs(x1 - x0) < 300 || abs(y1 - y0) < 300) {
+    touchCalStep = 4;
+    return;
+  }
+  touchCalSwap = swap;
+  touchCalX0 = x0; touchCalX1 = x1; touchCalY0 = y0; touchCalY1 = y1;
+  touchCalRotation = displayRotation;
+  touchCalValid = true;
+  saveTouchCal();
+  touchCalStep = 3;
+}
+
+void handleTouchCalTouch(bool justTouched, bool touchedNow) {
+  if (touchCalStep < 3) {
+    if (!justTouched) return;
+    touchCalRaw[touchCalStep] = readRawTouchAveraged();
+    touchCalStep++;
+    if (touchCalStep == 3) finishTouchCalibration();
+    drawTouchCalScreen();
+    return;
+  }
+  if (!touchedNow) return;
+  TS_Point p = ts.getPoint();
+  int x, y;
+  mapTouchXY(p, x, y);
+  if (justTouched && y >= 250 && y <= 294) {
+    if (x >= 20 && x <= 116) { touchCalStep = 0; drawTouchCalScreen(); return; }
+    if (x >= 124 && x <= 220) { leaveTouchCalibration(); return; }
+  }
+  if (y > 110 && y < 244) tft.fillCircle(x, y, 2, COLOR_ACCENT);   // test dots
+}
+
+// ============================================================
 // SETUP + MAIN LOOP
 // ============================================================
 void setup() {
@@ -3383,6 +3597,7 @@ void setup() {
   homeAnimationsEnabled = loadHomeAnimations();
   homeWidget = loadHomeWidget();
   loadDeviceName();
+  loadTouchCal();
   tft.setRotation(displayRotation);
 
   char hostname[33];
@@ -3401,6 +3616,9 @@ void setup() {
   server.on("/addhomework", handleWebAddHomework);
   server.on("/deletetodo", handleWebDeleteTodo);
   server.on("/deletehomework", handleWebDeleteHomework);
+  server.on("/calibrate", handleWebCalibrate);
+  server.on("/update", handleWebUpdate);
+  server.on("/restart", handleWebRestart);
   server.begin();
 
   DateTime now = rtc.now();
@@ -3422,6 +3640,21 @@ void setup() {
 // only ever toggles between DISPLAY_ROTATION and its +2 (180-degree)
 // partner, so a simple coordinate flip covers both states.
 void mapTouchXY(TS_Point p, int &tx, int &ty) {
+  if (touchCalValid) {
+    int rx = touchCalSwap ? p.y : p.x;
+    int ry = touchCalSwap ? p.x : p.y;
+    tx = CAL_X0 + (long)(rx - touchCalX0) * (CAL_X1 - CAL_X0) / (touchCalX1 - touchCalX0);
+    ty = CAL_Y0 + (long)(ry - touchCalY0) * (CAL_Y1 - CAL_Y0) / (touchCalY1 - touchCalY0);
+    // calibrated with the picture one way up; if it has since been flipped,
+    // flip the touch to match
+    if (displayRotation != touchCalRotation) {
+      tx = 239 - tx;
+      ty = 319 - ty;
+    }
+    tx = constrain(tx, 0, 239);
+    ty = constrain(ty, 0, 319);
+    return;
+  }
   int rawX = map(p.x, 200, 3800, 0, 240);
   int rawY = map(p.y, 200, 3800, 0, 320);
   if (displayRotation == DISPLAY_ROTATION) {
@@ -3466,6 +3699,20 @@ void loop() {
   maybeReinitDisplay(now);
   updateIpLine();
   applyNtpToRtc();
+
+  // Emergency: hold anywhere for 6 seconds to recalibrate touch (not while
+  // drawing a note or playing Snake, where long presses are normal).
+  if (touchedNow && currentScreen != SCREEN_NOTES && currentScreen != SCREEN_SNAKE && currentScreen != SCREEN_TOUCH_CAL) {
+    if (touchHoldStartMs == 0) touchHoldStartMs = millis();
+    else if (millis() - touchHoldStartMs > 6000) {
+      touchHoldStartMs = 0;
+      startTouchCalibration(SCREEN_HOME);
+    }
+  } else if (!touchedNow) {
+    touchHoldStartMs = 0;
+  }
+
+  runWebRequests();
 
   wasTouched = touchedNow;
 
@@ -3656,6 +3903,10 @@ void loop() {
         currentScreen = SCREEN_SETTINGS;
         drawSettingsScreen();
       }
+      break;
+
+    case SCREEN_TOUCH_CAL:
+      handleTouchCalTouch(justTouched, touchedNow);
       break;
 
     case SCREEN_THEMES:
