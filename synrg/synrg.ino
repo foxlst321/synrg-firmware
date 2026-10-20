@@ -62,7 +62,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v2.6"
+#define FIRMWARE_VERSION "v2.7"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -406,6 +406,75 @@ void startTimeSync() {
   configTzTime(TIME_ZONE, "pool.ntp.org", "time.nist.gov", "time.google.com");
 }
 
+// ---- Clock source. Everything reads the time through clockNow(), which
+// uses the ESP32's own clock once it has been set (from internet time, or
+// from the RTC at boot) because that always ticks. The RTC chip is the
+// backup that keeps time while the PDA is off. If the RTC itself has
+// stopped counting, About shows "Not ticking". ----
+bool rtcOK = false;
+bool rtcTicking = true;
+uint32_t rtcCheckUnix = 0;
+unsigned long rtcCheckMs = 0;
+unsigned long lastNtpSyncMs = 0;
+
+bool systemTimeValid() { return time(nullptr) > 1704067200; }   // after 2024-01-01
+
+DateTime clockNow() {
+  if (systemTimeValid()) {
+    time_t n = time(nullptr);
+    struct tm t;
+    localtime_r(&n, &t);
+    return DateTime(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+  }
+  return rtc.now();
+}
+
+void setSystemTime(const DateTime& dt) {
+  struct tm t = {};
+  t.tm_year = dt.year() - 1900;
+  t.tm_mon = dt.month() - 1;
+  t.tm_mday = dt.day();
+  t.tm_hour = dt.hour();
+  t.tm_min = dt.minute();
+  t.tm_sec = dt.second();
+  t.tm_isdst = -1;                     // let the time zone rules decide DST
+  struct timeval tv = { mktime(&t), 0 };
+  settimeofday(&tv, nullptr);
+}
+
+// Used when the time is set by hand: update both clocks.
+void setClock(const DateTime& dt) {
+  rtc.adjust(dt);
+  setSystemTime(dt);
+  rtcCheckMs = 0;   // restart the RTC health check from the new time
+  lastDrawnMinute = -1;
+}
+
+// At boot: make sure the RTC is counting, and start the ESP32 clock from it.
+void initClockFromRtc() {
+  if (!rtcOK) return;
+  rtc.start();                         // clears the chip's STOP bit if it was set
+  DateTime r = rtc.now();
+  if (r.year() >= 2024 && r.year() < 2100) setSystemTime(r);
+}
+
+// Once a minute: check that the RTC is actually counting, and if internet
+// time hasn't refreshed in 2 hours, re-align the ESP32 clock to the RTC.
+void maintainClock() {
+  if (!rtcOK) return;
+  if (rtcCheckMs != 0 && millis() - rtcCheckMs < 60000) return;
+  DateTime r = rtc.now();
+  if (rtcCheckMs != 0) {
+    long rtcDelta = (long)(r.unixtime() - rtcCheckUnix);
+    long msDelta = (long)((millis() - rtcCheckMs) / 1000);
+    rtcTicking = labs(rtcDelta - msDelta) <= 5;
+    bool ntpStale = (lastNtpSyncMs == 0 || millis() - lastNtpSyncMs > 2UL * 3600UL * 1000UL);
+    if (rtcTicking && ntpStale && r.year() >= 2024) setSystemTime(r);
+  }
+  rtcCheckUnix = r.unixtime();
+  rtcCheckMs = millis();
+}
+
 // Called from loop(): when a fresh internet time has arrived, write it into
 // the RTC and redraw the clock on Home/Lock.
 void applyNtpToRtc() {
@@ -416,6 +485,8 @@ void applyNtpToRtc() {
   if (t.tm_year + 1900 < 2024) return;   // not a real time yet
   DateTime synced(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
   rtc.adjust(synced);
+  rtcCheckMs = 0;
+  lastNtpSyncMs = millis();
   rtcEverSynced = true;
   lastRtcSync = synced;
   lastDrawnMinute = -1;   // force Home/Lock to redraw the corrected time
@@ -431,7 +502,6 @@ const unsigned long REINIT_INTERVAL_MS = 5UL * 60UL * 1000UL;
 
 // ---- Startup status, used by About screen ----
 bool storageOK = false;
-bool rtcOK = false;
 
 // ---- Onscreen keyboard state (shared widget) ----
 enum KeyboardContext { KB_CONTEXT_NONE, KB_CONTEXT_ADD_TODO, KB_CONTEXT_ADD_HOMEWORK, KB_CONTEXT_WIFI_PASSWORD, KB_CONTEXT_DEVICE_NAME };
@@ -880,7 +950,7 @@ String htmlEscape(const char* in) {
 }
 
 void handleWebRoot() {
-  DateTime now = rtc.now();
+  DateTime now = clockNow();
   char timeStr[9];
   formatTime12h(timeStr, now.hour(), now.minute());
 
@@ -903,7 +973,15 @@ void handleWebRoot() {
   html += "input[type=text]{padding:8px;width:70%;background:" + surface + ";color:" + text + ";border:1px solid " + sub + ";border-radius:8px;}";
   html += "input[type=submit]{padding:8px 16px;background:" + accent + ";color:#fff;border:none;border-radius:8px;cursor:pointer;}</style>";
   html += "</head><body>";
-  html += "<header><h1>" + name + "</h1><p>" + String(timeStr) + "</p></header>";
+  html += "<header><h1>" + name + "</h1><p id='clk'>" + String(timeStr) + "</p></header>";
+  // Live clock: starts from the PDA's time, ticks every second in the
+  // browser, and re-checks the PDA every 30 seconds.
+  long secs = (long)now.hour() * 3600 + now.minute() * 60 + now.second();
+  html += "<script>var t=" + String(secs) + ";";
+  html += "function f(){var h=Math.floor(t/3600)%24,m=Math.floor(t/60)%60,s=t%60;";
+  html += "document.getElementById('clk').textContent=(h%12||12)+':'+(m<10?'0':'')+m+':'+(s<10?'0':'')+s+(h<12?' AM':' PM');}";
+  html += "setInterval(function(){t=(t+1)%86400;f();},1000);";
+  html += "setInterval(function(){fetch('/time').then(function(r){return r.text();}).then(function(x){var v=parseInt(x);if(!isNaN(v)){t=v;f();}}).catch(function(){});},30000);f();</script>";
 
   html += "<h2>To-Do</h2><ul>";
   char line[40];
@@ -970,7 +1048,7 @@ void handleWebAddTodo() {
 
 void handleWebAddHomework() {
   if (server.hasArg("text") && server.arg("text").length() > 0) {
-    DateTime now = rtc.now();
+    DateTime now = clockNow();
     int idx = guessHomeworkPeriodIndex(now.hour(), now.minute());
     const char* periodName = (idx == -1) ? "Unscheduled" : schedule[idx].name;
     File f = LittleFS.open("/homework.txt", FILE_APPEND);
@@ -1024,6 +1102,12 @@ void handleWebCalibrate() {
 void handleWebUpdate() {
   webOtaRequested = true;
   sendWebMessage("Checking for an update -- watch the PDA screen. If one is found it installs and restarts.");
+}
+
+void handleWebTime() {
+  DateTime now = clockNow();
+  long secs = (long)now.hour() * 3600 + now.minute() * 60 + now.second();
+  server.send(200, "text/plain", String(secs));
 }
 
 void handleWebRestart() {
@@ -1406,7 +1490,7 @@ void handleKeyboardTouch(int x, int y) {
       if (kbBufferLen > 0) {
         strncpy(pendingHomeworkText, kbBuffer, sizeof(pendingHomeworkText) - 1);
         pendingHomeworkText[sizeof(pendingHomeworkText) - 1] = '\0';
-        DateTime now = rtc.now();
+        DateTime now = clockNow();
         hwPeriodPickerIndex = guessHomeworkPeriodIndex(now.hour(), now.minute());
         currentScreen = SCREEN_HW_PERIOD;
         drawHwPeriodScreen();
@@ -1458,7 +1542,7 @@ void startDeviceNameEntry() {
 // otherwise it's back to Settings.
 void leaveDeviceNameEntry() {
   if (firstBootFlow) {
-    DateTime now = rtc.now();
+    DateTime now = clockNow();
     editHour = now.hour();
     editMinute = now.minute();
     currentScreen = SCREEN_SET_TIME;
@@ -1592,8 +1676,8 @@ void handleTouchTestTouch(int x, int y) {
       startDeviceNameEntry();
     } else {
       currentScreen = SCREEN_HOME;
-      drawHomeScreen(rtc.now());
-      lastDrawnMinute = rtc.now().minute();
+      drawHomeScreen(clockNow());
+      lastDrawnMinute = clockNow().minute();
     }
   }
 }
@@ -1813,7 +1897,7 @@ int countFileLines(const char* path) {
 }
 
 void drawWidgetTile() {
-  DateTime now = rtc.now();
+  DateTime now = clockNow();
   drawGlassRect(tileX[0], tileY[0], tileW, tileH, 20, tileColors[0]);
 
   int x = tileX[0] + 10, y = tileY[0];
@@ -1894,7 +1978,7 @@ void drawHomeScreen(DateTime now) {
 
 void handleHomeTouch(int x, int y) {
   if (touchedHomeLockArrow(x, y)) {
-    DateTime now = rtc.now();
+    DateTime now = clockNow();
     currentScreen = SCREEN_LOCK;
     drawLockScreen(now);
     lastDrawnMinute = now.minute();
@@ -2884,8 +2968,8 @@ void drawMoreAboutScreen() {
   tft.setTextColor(COLOR_TEXT);
   tft.setCursor(20, 110);
   tft.print("RTC: ");
-  tft.setTextColor(rtcOK ? COLOR_HOMEWORK : COLOR_ERROR);
-  tft.print(rtcOK ? "OK" : "Not Found");
+  tft.setTextColor(rtcOK && rtcTicking ? COLOR_HOMEWORK : COLOR_ERROR);
+  tft.print(!rtcOK ? "Not Found" : (rtcTicking ? "OK" : "Not ticking"));
 
   tft.setTextColor(COLOR_TEXT);
   tft.setCursor(20, 140);
@@ -3201,13 +3285,13 @@ void handleSettingsTouch(int x, int y) {
     if (x >= 20 && x <= 220 && y >= rowY && y <= rowY + 44) {
       MoreAction action = cat.items[i];
       if (action == MORE_ACTION_SET_TIME) {
-        DateTime now = rtc.now();
+        DateTime now = clockNow();
         editHour = now.hour();
         editMinute = now.minute();
         currentScreen = SCREEN_SET_TIME;
         drawSetTimeScreen();
       } else if (action == MORE_ACTION_SET_DATE) {
-        DateTime now = rtc.now();
+        DateTime now = clockNow();
         editYear = now.year();
         editMonth = now.month();
         editDay = now.day();
@@ -3437,15 +3521,15 @@ void handleSetTimeTouch(int x, int y) {
     drawSetTimeScreen(); return;
   }
   if (x >= 70 && x <= 170 && y >= 270 && y <= 310) {
-    DateTime now = rtc.now();
+    DateTime now = clockNow();
     int yr = now.year() < 2020 ? 2026 : now.year();
     int mo = now.month() < 1 ? 1 : now.month();
     int dy = now.day() < 1 ? 1 : now.day();
-    rtc.adjust(DateTime(yr, mo, dy, editHour, editMinute, 0));
+    setClock(DateTime(yr, mo, dy, editHour, editMinute, 0));
     Serial.println("Time saved.");
 
     if (firstBootFlow) {
-      DateTime updated = rtc.now();
+      DateTime updated = clockNow();
       editYear = updated.year();
       editMonth = updated.month();
       editDay = updated.day();
@@ -3505,14 +3589,14 @@ void handleSetDateTouch(int x, int y) {
   if (x >= 168 && x <= 232 && y >= 190 && y <= 230) { if (editYear > 2000) { editYear--; clampEditDay(); } drawSetDateScreen(); return; }
 
   if (x >= 70 && x <= 170 && y >= 250 && y <= 290) {
-    DateTime now = rtc.now();
-    rtc.adjust(DateTime(editYear, editMonth, editDay, now.hour(), now.minute(), now.second()));
+    DateTime now = clockNow();
+    setClock(DateTime(editYear, editMonth, editDay, now.hour(), now.minute(), now.second()));
     Serial.println("Date saved.");
 
     if (firstBootFlow) {
       firstBootFlow = false;
       currentScreen = SCREEN_HOME;
-      DateTime updated = rtc.now();
+      DateTime updated = clockNow();
       drawHomeScreen(updated);
       lastDrawnMinute = updated.minute();
     } else {
@@ -3581,8 +3665,8 @@ void leaveTouchCalibration() {
     drawSettingsScreen();
   } else {
     currentScreen = SCREEN_HOME;
-    drawHomeScreen(rtc.now());
-    lastDrawnMinute = rtc.now().minute();
+    drawHomeScreen(clockNow());
+    lastDrawnMinute = clockNow().minute();
   }
 }
 
@@ -3679,6 +3763,7 @@ void setup() {
   WiFi.setHostname(hostname);
   WiFi.mode(WIFI_STA);
   startTimeSync();
+  initClockFromRtc();
 
   loadThemeSettings();
   applyTheme(currentTheme);
@@ -3693,9 +3778,10 @@ void setup() {
   server.on("/calibrate", handleWebCalibrate);
   server.on("/update", handleWebUpdate);
   server.on("/restart", handleWebRestart);
+  server.on("/time", handleWebTime);
   server.begin();
 
-  DateTime now = rtc.now();
+  DateTime now = clockNow();
   if (now.year() < 2020) {
     firstBootFlow = true;
     touchTestResult = 0;
@@ -3741,7 +3827,7 @@ void mapTouchXY(TS_Point p, int &tx, int &ty) {
 }
 
 void loop() {
-  DateTime now = rtc.now();
+  DateTime now = clockNow();
 
   server.handleClient();
 
@@ -3774,6 +3860,7 @@ void loop() {
   maybeReinitDisplay(now);
   updateIpLine();
   applyNtpToRtc();
+  maintainClock();
 
   // Emergency: hold anywhere for 6 seconds to recalibrate touch (not while
   // drawing a note or playing Snake, where long presses are normal).
