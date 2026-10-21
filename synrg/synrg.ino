@@ -28,6 +28,7 @@
 #include <XPT2046_Touchscreen.h>
 #include "RTClib.h"
 #include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/FreeSansBold9pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
@@ -50,7 +51,16 @@
 
 // Settings actions -- declared up here so the Arduino IDE's auto-generated
 // function prototypes can see the type.
-enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM, SCREEN_TOUCH_CAL };
+// Messages types (see the MESSAGES block further down) -- up here so the
+// Arduino IDE's auto-generated prototypes can see them.
+#define DEVICE_NAME_MAX 20
+#define MSG_TEXT_MAX 60
+struct Contact { char name[DEVICE_NAME_MAX + 1]; char ip[16]; int unread; };
+struct MsgLine { char dir; char ip[16]; char when[9]; char text[MSG_TEXT_MAX + 1]; };
+
+enum KeyboardContext { KB_CONTEXT_NONE, KB_CONTEXT_ADD_TODO, KB_CONTEXT_ADD_HOMEWORK, KB_CONTEXT_WIFI_PASSWORD, KB_CONTEXT_DEVICE_NAME, KB_CONTEXT_MSG_IP, KB_CONTEXT_MSG_TEXT };
+enum KeyboardMode { KB_MODE_ABC, KB_MODE_123, KB_MODE_SYM };
+enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM, SCREEN_TOUCH_CAL, SCREEN_MESSAGES, SCREEN_CHAT, SCREEN_MSG_REQUEST };
 enum SnakeDir { SNAKE_UP, SNAKE_DOWN, SNAKE_LEFT, SNAKE_RIGHT };
 enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME, MORE_ACTION_DEVICE_NAME, MORE_ACTION_TOUCH_CAL };
 
@@ -62,7 +72,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v2.7"
+#define FIRMWARE_VERSION "v2.8"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -240,7 +250,6 @@ void loadThemeSettings() {
 // ---- Device name: chosen during first-time setup (or Settings > System >
 // Device Name). Shown on the web page and used as the WiFi hostname.
 // Saved to /name.txt. ----
-#define DEVICE_NAME_MAX 20
 char deviceName[DEVICE_NAME_MAX + 1] = "SynRG";
 
 void loadDeviceName() {
@@ -504,10 +513,8 @@ const unsigned long REINIT_INTERVAL_MS = 5UL * 60UL * 1000UL;
 bool storageOK = false;
 
 // ---- Onscreen keyboard state (shared widget) ----
-enum KeyboardContext { KB_CONTEXT_NONE, KB_CONTEXT_ADD_TODO, KB_CONTEXT_ADD_HOMEWORK, KB_CONTEXT_WIFI_PASSWORD, KB_CONTEXT_DEVICE_NAME };
 KeyboardContext kbContext = KB_CONTEXT_NONE;
 // Three pages: letters, numbers + common symbols, and fancy symbols.
-enum KeyboardMode { KB_MODE_ABC, KB_MODE_123, KB_MODE_SYM };
 KeyboardMode kbMode = KB_MODE_ABC;
 bool kbShift = false;
 char kbBuffer[64] = "";
@@ -1079,6 +1086,476 @@ void handleWebDeleteHomework() {
   server.send(303);
 }
 
+// ============================================================
+// MESSAGES -- AirDrop-style chat between SynRGs on the same WiFi.
+//  * Messaging is off until you switch it on; while off, nobody can reach you.
+//  * New Chat: type the other PDA's IP (shown on its Home/Lock screen). It
+//    gets a pop-up "<name> wants to connect" with Accept / Decline.
+//  * On Accept both PDAs save each other in Contacts (name + IP), and from
+//    then on can text each other. Only contacts can send you messages.
+// Wire protocol (plain HTTP on port 80):
+//   /msg/request?from=NAME        ask to connect
+//   /msg/accept?from=NAME         the other side said yes
+//   /msg/send?from=NAME&text=TXT  a message (contacts only)
+// Files: /msgon.txt (1/0), /contacts.txt (name|ip), /messages.txt
+// (dir|ip|time|text, newest MSG_KEEP kept).
+// ============================================================
+#define MSG_KEEP 40
+#define MAX_CONTACTS 8
+
+bool messagingOn = false;
+
+Contact contacts[MAX_CONTACTS];
+int contactCount = 0;
+
+MsgLine msgList[MSG_KEEP];
+int msgCount = 0;
+
+int chatContact = -1;              // contact open in the chat screen
+char msgStatus[40] = "";
+char msgOutgoingIp[16] = "";       // we asked this IP to connect, waiting for Accept
+char newChatIp[16] = "";
+
+// incoming connect request waiting for Accept/Decline
+bool reqPending = false;
+char reqName[DEVICE_NAME_MAX + 1] = "";
+char reqIp[16] = "";
+Screen reqReturnScreen = SCREEN_HOME;
+
+// one-line notice shown on Home ("Hound Dog accepted", "New message from ...")
+char msgBanner[40] = "";
+
+int totalUnread() {
+  int n = 0;
+  for (int i = 0; i < contactCount; i++) n += contacts[i].unread;
+  return n;
+}
+
+// Strip characters that would break the one-line-per-entry files.
+void cleanMsgField(char* out, size_t len, const char* in) {
+  size_t j = 0;
+  for (size_t i = 0; in[i] && j < len - 1; i++) {
+    char c = in[i];
+    if (c == '|' || c == '\n' || c == '\r') c = ' ';
+    if ((unsigned char)c < 32 || (unsigned char)c > 126) continue;
+    out[j++] = c;
+  }
+  out[j] = '\0';
+}
+
+void saveMessagingOn() {
+  LittleFS.remove("/msgon.txt");
+  File f = LittleFS.open("/msgon.txt", FILE_WRITE);
+  if (f) { f.print(messagingOn ? 1 : 0); f.close(); }
+}
+
+void saveContacts() {
+  LittleFS.remove("/contacts.txt");
+  File f = LittleFS.open("/contacts.txt", FILE_WRITE);
+  if (!f) return;
+  for (int i = 0; i < contactCount; i++) f.printf("%s|%s\n", contacts[i].name, contacts[i].ip);
+  f.close();
+}
+
+int findContactByIp(const char* ip) {
+  for (int i = 0; i < contactCount; i++) if (strcmp(contacts[i].ip, ip) == 0) return i;
+  return -1;
+}
+
+// Adds (or renames) a contact; returns its index, or -1 if the list is full.
+int addOrUpdateContact(const char* name, const char* ip) {
+  int i = findContactByIp(ip);
+  if (i < 0) {
+    if (contactCount >= MAX_CONTACTS) return -1;
+    i = contactCount++;
+    contacts[i].unread = 0;
+  }
+  cleanMsgField(contacts[i].name, sizeof(contacts[i].name), name[0] ? name : "SynRG");
+  cleanMsgField(contacts[i].ip, sizeof(contacts[i].ip), ip);
+  saveContacts();
+  return i;
+}
+
+void saveMessages() {
+  LittleFS.remove("/messages.txt");
+  File f = LittleFS.open("/messages.txt", FILE_WRITE);
+  if (!f) return;
+  for (int i = 0; i < msgCount; i++)
+    f.printf("%c|%s|%s|%s\n", msgList[i].dir, msgList[i].ip, msgList[i].when, msgList[i].text);
+  f.close();
+}
+
+void pushMessage(const MsgLine& m) {
+  if (msgCount == MSG_KEEP) { memmove(&msgList[0], &msgList[1], sizeof(MsgLine) * (MSG_KEEP - 1)); msgCount--; }
+  msgList[msgCount++] = m;
+}
+
+void addMessage(char dir, const char* ip, const char* text) {
+  MsgLine m;
+  m.dir = dir;
+  cleanMsgField(m.ip, sizeof(m.ip), ip);
+  cleanMsgField(m.text, sizeof(m.text), text);
+  DateTime now = clockNow();
+  formatTime12h(m.when, now.hour(), now.minute());
+  pushMessage(m);
+  saveMessages();
+}
+
+// split "a|b|c" in place; returns how many parts were found
+int splitBars(char* line, char** parts, int maxParts) {
+  int n = 0;
+  parts[n++] = line;
+  for (char* p = line; *p && n < maxParts; p++)
+    if (*p == '|') { *p = '\0'; parts[n++] = p + 1; }
+  return n;
+}
+
+void loadMessaging() {
+  if (LittleFS.exists("/msgon.txt")) {
+    File f = LittleFS.open("/msgon.txt");
+    if (f) { messagingOn = (f.read() == '1'); f.close(); }
+  }
+  char line[120];
+  char* parts[4];
+  contactCount = 0;
+  if (LittleFS.exists("/contacts.txt")) {
+    File f = LittleFS.open("/contacts.txt");
+    while (f && readLineFromFile(f, line, sizeof(line)) && contactCount < MAX_CONTACTS) {
+      if (splitBars(line, parts, 2) < 2) continue;
+      Contact& c = contacts[contactCount++];
+      cleanMsgField(c.name, sizeof(c.name), parts[0]);
+      cleanMsgField(c.ip, sizeof(c.ip), parts[1]);
+      c.unread = 0;
+    }
+    if (f) f.close();
+  }
+  msgCount = 0;
+  if (LittleFS.exists("/messages.txt")) {
+    File f = LittleFS.open("/messages.txt");
+    while (f && readLineFromFile(f, line, sizeof(line))) {
+      if (splitBars(line, parts, 4) < 4) continue;
+      MsgLine m;
+      m.dir = parts[0][0];
+      cleanMsgField(m.ip, sizeof(m.ip), parts[1]);
+      cleanMsgField(m.when, sizeof(m.when), parts[2]);
+      cleanMsgField(m.text, sizeof(m.text), parts[3]);
+      pushMessage(m);
+    }
+    if (f) f.close();
+  }
+}
+
+String urlEncode(const char* in) {
+  String out;
+  const char* hex = "0123456789ABCDEF";
+  for (; *in; in++) {
+    unsigned char c = *in;
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+    else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
+  }
+  return out;
+}
+
+// Calls another SynRG; returns the HTTP code (200 = ok, 403 = they have
+// messaging off / we're not their contact, <0 = couldn't reach them).
+int callPeer(const char* ip, const String& pathAndQuery) {
+  if (WiFi.status() != WL_CONNECTED) return -100;
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(4000);
+  http.begin(client, String("http://") + ip + pathAndQuery);
+  int code = http.GET();
+  http.end();
+  return code;
+}
+
+void describePeerError(int code, const char* doing) {
+  if (code == -100) snprintf(msgStatus, sizeof(msgStatus), "No WiFi");
+  else if (code == 403) snprintf(msgStatus, sizeof(msgStatus), "They have messaging off");
+  else if (code == 404) snprintf(msgStatus, sizeof(msgStatus), "Not a SynRG with Messages");
+  else if (code < 0) snprintf(msgStatus, sizeof(msgStatus), "Couldn't reach that IP");
+  else snprintf(msgStatus, sizeof(msgStatus), "%s failed (%d)", doing, code);
+}
+
+void sendConnectRequest(const char* ip) {
+  IPAddress target;
+  if (!target.fromString(ip)) { strcpy(msgStatus, "That IP doesn't look right"); return; }
+  if (WiFi.status() == WL_CONNECTED && target == WiFi.localIP()) { strcpy(msgStatus, "That's this PDA's own IP"); return; }
+  int existing = findContactByIp(ip);
+  if (existing >= 0) { openChat(existing); return; }
+  strcpy(msgStatus, "Asking to connect...");
+  drawMessagesScreen();
+  int code = callPeer(ip, "/msg/request?from=" + urlEncode(deviceName));
+  if (code == 200) {
+    strncpy(msgOutgoingIp, ip, sizeof(msgOutgoingIp) - 1);
+    msgOutgoingIp[sizeof(msgOutgoingIp) - 1] = '\0';
+    strcpy(msgStatus, "Request sent - waiting for them");
+  } else {
+    describePeerError(code, "Request");
+  }
+}
+
+void sendChatMessage(const char* text) {
+  if (chatContact < 0) return;
+  Contact& c = contacts[chatContact];
+  strcpy(msgStatus, "Sending...");
+  drawChatScreen();
+  int code = callPeer(c.ip, "/msg/send?from=" + urlEncode(deviceName) + "&text=" + urlEncode(text));
+  if (code == 200) {
+    addMessage('o', c.ip, text);
+    msgStatus[0] = '\0';
+  } else {
+    describePeerError(code, "Send");
+  }
+}
+
+// ---- incoming (web server handlers) ----
+bool canShowPopupNow() {
+  return currentScreen == SCREEN_HOME || currentScreen == SCREEN_LOCK ||
+         currentScreen == SCREEN_MESSAGES || currentScreen == SCREEN_CHAT ||
+         currentScreen == SCREEN_SETTINGS;
+}
+
+void refreshAfterIncoming() {
+  if (currentScreen == SCREEN_HOME) drawHomeScreen(clockNow());
+  else if (currentScreen == SCREEN_LOCK) drawLockScreen(clockNow());
+  else if (currentScreen == SCREEN_MESSAGES) drawMessagesScreen();
+  else if (currentScreen == SCREEN_CHAT) drawChatScreen();
+}
+
+void handleMsgRequest() {
+  if (!messagingOn) { server.send(403, "text/plain", "messaging off"); return; }
+  String from = server.hasArg("from") ? server.arg("from") : String("SynRG");
+  String ip = server.client().remoteIP().toString();
+  int existing = findContactByIp(ip.c_str());
+  if (existing >= 0) {                        // already friends: just say yes again
+    server.send(200, "text/plain", "ok");
+    callPeer(ip.c_str(), "/msg/accept?from=" + urlEncode(deviceName));
+    return;
+  }
+  server.send(200, "text/plain", "pending");
+  cleanMsgField(reqName, sizeof(reqName), from.length() ? from.c_str() : "SynRG");
+  cleanMsgField(reqIp, sizeof(reqIp), ip.c_str());
+  reqPending = true;
+  if (canShowPopupNow()) showConnectPopup();
+}
+
+void handleMsgAccept() {
+  String ip = server.client().remoteIP().toString();
+  if (strcmp(ip.c_str(), msgOutgoingIp) != 0 && findContactByIp(ip.c_str()) < 0) {
+    server.send(403, "text/plain", "no request");
+    return;
+  }
+  String from = server.hasArg("from") ? server.arg("from") : String("SynRG");
+  server.send(200, "text/plain", "ok");
+  int idx = addOrUpdateContact(from.c_str(), ip.c_str());
+  msgOutgoingIp[0] = '\0';
+  if (idx >= 0) {
+    snprintf(msgBanner, sizeof(msgBanner), "%s accepted!", contacts[idx].name);
+    snprintf(msgStatus, sizeof(msgStatus), "%s accepted!", contacts[idx].name);
+  }
+  refreshAfterIncoming();
+}
+
+void handleMsgSend() {
+  String ip = server.client().remoteIP().toString();
+  int idx = findContactByIp(ip.c_str());
+  if (!messagingOn || idx < 0) { server.send(403, "text/plain", "not a contact"); return; }
+  if (!server.hasArg("text") || server.arg("text").length() == 0) { server.send(400, "text/plain", "missing text"); return; }
+  if (server.hasArg("from") && server.arg("from").length())     // they may have renamed their PDA
+    addOrUpdateContact(server.arg("from").c_str(), ip.c_str());
+  addMessage('i', ip.c_str(), server.arg("text").c_str());
+  server.send(200, "text/plain", "ok");
+  if (!(currentScreen == SCREEN_CHAT && chatContact == idx)) {
+    contacts[idx].unread++;
+    snprintf(msgBanner, sizeof(msgBanner), "New message from %s", contacts[idx].name);
+  }
+  refreshAfterIncoming();
+}
+
+// ---- connect pop-up ----
+void showConnectPopup() {
+  if (currentScreen != SCREEN_MSG_REQUEST) reqReturnScreen = currentScreen;
+  currentScreen = SCREEN_MSG_REQUEST;
+  tft.fillRoundRect(16, 70, 208, 170, 18, COLOR_SHADOW);
+  tft.fillRoundRect(14, 66, 208, 170, 18, COLOR_SURFACE);
+  tft.drawRoundRect(14, 66, 208, 170, 18, COLOR_ACCENT);
+  printFitted(&FreeSansBold12pt7b, 118, 84, reqName, COLOR_TEXT, 196);
+  printCentered(&FreeSans9pt7b, 118, 114, "wants to connect", COLOR_TEXT);
+  tft.setFont();
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_SUBTEXT);
+  int16_t x1, y1; uint16_t tw, th;
+  tft.getTextBounds(reqIp, 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor(118 - tw / 2, 140);
+  tft.print(reqIp);
+  drawGlassRect(26, 176, 88, 44, 16, COLOR_ERROR);
+  printFitted(&FreeSansBold12pt7b, 70, 190, "Decline", ILI9341_WHITE, 80);
+  drawGlassRect(122, 176, 88, 44, 16, COLOR_ACCENT);
+  printFitted(&FreeSansBold12pt7b, 166, 190, "Accept", ILI9341_WHITE, 80);
+}
+
+void handleConnectPopupTouch(int x, int y) {
+  if (y < 176 || y > 220) return;
+  if (x >= 26 && x <= 114) {                      // Decline
+    reqPending = false;
+    currentScreen = reqReturnScreen;
+    if (currentScreen == SCREEN_MESSAGES) drawMessagesScreen();
+    else if (currentScreen == SCREEN_CHAT) drawChatScreen();
+    else if (currentScreen == SCREEN_SETTINGS) drawSettingsScreen();
+    else if (currentScreen == SCREEN_LOCK) drawLockScreen(clockNow());
+    else { currentScreen = SCREEN_HOME; drawHomeScreen(clockNow()); }
+    lastDrawnMinute = clockNow().minute();
+    return;
+  }
+  if (x >= 122 && x <= 210) {                     // Accept
+    reqPending = false;
+    int idx = addOrUpdateContact(reqName, reqIp);
+    callPeer(reqIp, "/msg/accept?from=" + urlEncode(deviceName));
+    if (idx >= 0) openChat(idx);
+    else { strcpy(msgStatus, "Contacts full (8)"); openMessages(); }
+  }
+}
+
+// ---- Messages app: switch, contacts, New Chat ----
+const int CONTACT_Y = 70, CONTACT_H = 38, CONTACT_ROWS = 5;
+
+void openMessages() {
+  chatContact = -1;
+  currentScreen = SCREEN_MESSAGES;
+  drawMessagesScreen();
+}
+
+void drawMessagesScreen() {
+  tft.fillScreen(COLOR_BG);
+  drawScreenFrame();
+  drawBackBar("Messages");
+
+  drawGlassRect(8, 30, 224, 32, 12, messagingOn ? COLOR_ACCENT : COLOR_SUBTEXT);
+  printFitted(&FreeSansBold12pt7b, 120, 38, messagingOn ? "Messaging: On" : "Messaging: Off", ILI9341_WHITE, 210);
+
+  if (contactCount == 0) {
+    printCentered(&FreeSans9pt7b, 120, 110, "No contacts yet", COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 134, "Tap New Chat and type", COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 154, "the other PDA's IP", COLOR_SUBTEXT);
+  }
+  for (int i = 0; i < contactCount && i < CONTACT_ROWS; i++) {
+    int y = CONTACT_Y + i * CONTACT_H;
+    drawGlassRect(8, y, 224, 34, 12, COLOR_SURFACE);
+    tft.setFont(&FreeSansBold9pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(18, y + 16);
+    tft.print(contacts[i].name);
+    tft.setFont();
+    tft.setTextColor(COLOR_SUBTEXT);
+    tft.setCursor(18, y + 22);
+    tft.print(contacts[i].ip);
+    if (contacts[i].unread > 0) {
+      tft.fillCircle(214, y + 17, 8, COLOR_ERROR);
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setCursor(contacts[i].unread > 9 ? 209 : 212, y + 14);
+      tft.print(contacts[i].unread > 9 ? 9 : contacts[i].unread);
+    }
+  }
+
+  if (msgStatus[0]) printCentered(&FreeSans9pt7b, 120, 256, msgStatus, COLOR_SUBTEXT);
+
+  drawGlassRect(20, 276, 200, 36, 16, messagingOn ? COLOR_BLUE : COLOR_SUBTEXT);
+  printFitted(&FreeSansBold12pt7b, 120, 286, "+ New Chat", ILI9341_WHITE, 188);
+}
+
+void startMsgKeyboard(KeyboardContext ctx, const char* prefill, KeyboardMode mode) {
+  strncpy(kbBuffer, prefill, sizeof(kbBuffer) - 1);
+  kbBuffer[sizeof(kbBuffer) - 1] = '\0';
+  kbBufferLen = strlen(kbBuffer);
+  kbMode = mode;
+  kbShift = false;
+  kbContext = ctx;
+  currentScreen = SCREEN_KEYBOARD;
+  drawKeyboardScreen();
+}
+
+void handleMessagesTouch(int x, int y) {
+  if (y >= 30 && y <= 62) {                                    // on/off switch
+    messagingOn = !messagingOn;
+    saveMessagingOn();
+    msgStatus[0] = '\0';
+    drawMessagesScreen();
+    return;
+  }
+  if (x >= 20 && x <= 220 && y >= 276 && y <= 312) {           // New Chat
+    if (!messagingOn) { strcpy(msgStatus, "Turn Messaging on first"); drawMessagesScreen(); return; }
+    msgStatus[0] = '\0';
+    startMsgKeyboard(KB_CONTEXT_MSG_IP, newChatIp, KB_MODE_123);
+    return;
+  }
+  for (int i = 0; i < contactCount && i < CONTACT_ROWS; i++) {
+    int ry = CONTACT_Y + i * CONTACT_H;
+    if (y >= ry && y <= ry + 34) { openChat(i); return; }
+  }
+}
+
+// ---- chat with one contact ----
+const int CHAT_ROWS = 6, CHAT_Y = 30, CHAT_ROW_H = 36;
+
+void openChat(int idx) {
+  chatContact = idx;
+  contacts[idx].unread = 0;
+  msgStatus[0] = '\0';
+  currentScreen = SCREEN_CHAT;
+  drawChatScreen();
+}
+
+void drawChatScreen() {
+  if (chatContact < 0 || chatContact >= contactCount) { openMessages(); return; }
+  Contact& c = contacts[chatContact];
+  tft.fillScreen(COLOR_BG);
+  drawScreenFrame();
+  drawBackBar(c.name);
+
+  // the newest CHAT_ROWS messages with this contact, oldest at the top
+  int idxs[CHAT_ROWS];
+  int n = 0;
+  for (int i = msgCount - 1; i >= 0 && n < CHAT_ROWS; i--)
+    if (strcmp(msgList[i].ip, c.ip) == 0) idxs[n++] = i;
+
+  if (n == 0) printCentered(&FreeSans9pt7b, 120, 120, "Say hi!", COLOR_SUBTEXT);
+  for (int k = 0; k < n; k++) {
+    MsgLine& m = msgList[idxs[n - 1 - k]];
+    int y = CHAT_Y + k * CHAT_ROW_H;
+    bool out = (m.dir == 'o');
+    int bx = out ? 40 : 8;
+    drawGlassRect(bx, y, 192, 32, 10, out ? COLOR_ACCENT : COLOR_SURFACE);
+    tft.setFont();
+    tft.setTextSize(1);
+    tft.setTextColor(out ? ILI9341_WHITE : COLOR_TEXT);
+    // up to two lines of 30 characters
+    char line1[31], line2[31];
+    snprintf(line1, sizeof(line1), "%s", m.text);
+    snprintf(line2, sizeof(line2), "%s", strlen(m.text) > 30 ? m.text + 30 : "");
+    tft.setCursor(bx + 8, y + 6);
+    tft.print(line1);
+    tft.setCursor(bx + 8, y + 17);
+    tft.print(line2);
+    tft.setTextColor(out ? ILI9341_WHITE : COLOR_SUBTEXT);
+    tft.setCursor(bx + 192 - 8 - strlen(m.when) * 6, y + 24);
+    tft.print(m.when);
+  }
+
+  if (msgStatus[0]) printCentered(&FreeSans9pt7b, 120, 252, msgStatus, COLOR_SUBTEXT);
+
+  drawGlassRect(20, 272, 200, 40, 16, COLOR_ACCENT);
+  printFitted(&FreeSansBold12pt7b, 120, 284, "Write Message", ILI9341_WHITE, 188);
+}
+
+void handleChatTouch(int x, int y) {
+  if (x >= 20 && x <= 220 && y >= 272 && y <= 312) {
+    msgStatus[0] = '\0';
+    startMsgKeyboard(KB_CONTEXT_MSG_TEXT, "", KB_MODE_ABC);
+  }
+}
+
 // ---- Device controls on the web page, so the PDA can still be calibrated,
 // updated or restarted when its touch isn't working. The heavy work runs in
 // loop() after the browser has had its reply. ----
@@ -1382,6 +1859,8 @@ int kbMaxLen() {
   if (kbContext == KB_CONTEXT_WIFI_PASSWORD) return 63;
   if (kbContext == KB_CONTEXT_ADD_TODO) return 35;
   if (kbContext == KB_CONTEXT_DEVICE_NAME) return DEVICE_NAME_MAX;
+  if (kbContext == KB_CONTEXT_MSG_IP) return 15;
+  if (kbContext == KB_CONTEXT_MSG_TEXT) return MSG_TEXT_MAX;
   return 36;
 }
 
@@ -1391,6 +1870,8 @@ void drawKeyboardScreen() {
   if (kbContext == KB_CONTEXT_ADD_HOMEWORK) title = "Add Homework";
   if (kbContext == KB_CONTEXT_WIFI_PASSWORD) title = "WiFi Password";
   if (kbContext == KB_CONTEXT_DEVICE_NAME) title = "Name Your Device";
+  if (kbContext == KB_CONTEXT_MSG_IP) title = "Send To (IP)";
+  if (kbContext == KB_CONTEXT_MSG_TEXT) title = "New Message";
   drawBackBar(title);
 
   tft.fillRoundRect(10, 30, 220, 40, 12, COLOR_SURFACE);
@@ -1518,6 +1999,18 @@ void handleKeyboardTouch(int x, int y) {
         saveDeviceName();
       }
       leaveDeviceNameEntry();
+    } else if (kbContext == KB_CONTEXT_MSG_IP) {
+      openMessages();
+      if (kbBufferLen > 0) {
+        strncpy(newChatIp, kbBuffer, sizeof(newChatIp) - 1);
+        newChatIp[sizeof(newChatIp) - 1] = '\0';
+        sendConnectRequest(newChatIp);
+        if (currentScreen == SCREEN_MESSAGES) drawMessagesScreen();
+      }
+    } else if (kbContext == KB_CONTEXT_MSG_TEXT) {
+      currentScreen = SCREEN_CHAT;
+      if (kbBufferLen > 0) sendChatMessage(kbBuffer);
+      drawChatScreen();
     } else {
       currentScreen = SCREEN_TODO;
       drawTodoScreen();
@@ -1762,6 +2255,14 @@ void drawLockScreen(DateTime now) {
   tft.setCursor((240 - tw) / 2, 260);
   tft.print(hint);
 
+  if (totalUnread() > 0) {
+    char note[40];
+    int n = totalUnread();
+    if (n == 1) snprintf(note, sizeof(note), "%s", msgBanner);
+    else snprintf(note, sizeof(note), "%d new messages", n);
+    printFitted(&FreeSans9pt7b, 120, 228, note, COLOR_ACCENT, 224);
+  }
+
   drawIpLine();
 }
 
@@ -1782,6 +2283,15 @@ void drawTileFrame(int x, int y, int w, int h, uint16_t color, const char* label
 // returns to the lock screen.
 bool touchedHomeLockArrow(int x, int y) { return x < 36 && y < 28; }
 
+// Messages icon in the Home status bar; a red dot means unread messages.
+void drawEnvelopeIcon(int x, int y) {
+  tft.drawRect(x, y, 18, 12, ILI9341_WHITE);
+  tft.drawLine(x, y, x + 9, y + 7, ILI9341_WHITE);
+  tft.drawLine(x + 17, y, x + 8, y + 7, ILI9341_WHITE);
+  if (totalUnread() > 0 || reqPending) tft.fillCircle(x + 18, y, 4, COLOR_ERROR);
+}
+bool touchedHomeEnvelope(int x, int y) { return x >= 128 && x <= 168 && y < 28; }
+
 void drawHomeStatusBar(DateTime now) {
   tft.fillRect(0, 0, 240, 24, COLOR_STATUSBAR);
   tft.drawRoundRect(4, 3, 24, 18, 4, COLOR_GRAY);
@@ -1795,6 +2305,7 @@ void drawHomeStatusBar(DateTime now) {
   sprintf(dateStr, "%02d/%02d", now.month(), now.day());
   tft.setCursor(92, 8);
   tft.print(dateStr);
+  drawEnvelopeIcon(140, 6);
   char timeStr[9];
   formatTime12h(timeStr, now.hour(), now.minute());
   int16_t x1, y1; uint16_t tw, th;
@@ -1974,9 +2485,25 @@ void drawHomeScreen(DateTime now) {
     drawTileIcon(i, 20);
   }
   drawIpLine();
+  if (msgBanner[0]) {                 // "Hound Dog accepted!" / "New message from ..."
+    tft.fillRoundRect(20, 298, 200, 18, 8, COLOR_ACCENT);
+    tft.setFont();
+    tft.setTextSize(1);
+    tft.setTextColor(ILI9341_WHITE);
+    int16_t x1, y1; uint16_t tw, th;
+    tft.getTextBounds(msgBanner, 0, 0, &x1, &y1, &tw, &th);
+    tft.setCursor(120 - tw / 2, 303);
+    tft.print(msgBanner);
+  }
 }
 
 void handleHomeTouch(int x, int y) {
+  if (touchedHomeEnvelope(x, y)) {
+    msgBanner[0] = '\0';
+    if (reqPending) { showConnectPopup(); return; }
+    openMessages();
+    return;
+  }
   if (touchedHomeLockArrow(x, y)) {
     DateTime now = clockNow();
     currentScreen = SCREEN_LOCK;
@@ -3756,6 +4283,7 @@ void setup() {
   homeWidget = loadHomeWidget();
   loadDeviceName();
   loadTouchCal();
+  loadMessaging();
   tft.setRotation(displayRotation);
 
   char hostname[33];
@@ -3779,6 +4307,9 @@ void setup() {
   server.on("/update", handleWebUpdate);
   server.on("/restart", handleWebRestart);
   server.on("/time", handleWebTime);
+  server.on("/msg/request", handleMsgRequest);
+  server.on("/msg/accept", handleMsgAccept);
+  server.on("/msg/send", handleMsgSend);
   server.begin();
 
   DateTime now = clockNow();
@@ -3875,6 +4406,7 @@ void loop() {
   }
 
   runWebRequests();
+  if (reqPending && currentScreen != SCREEN_MSG_REQUEST && canShowPopupNow()) showConnectPopup();
 
   wasTouched = touchedNow;
 
@@ -3985,6 +4517,11 @@ void loop() {
             drawWifiScreen();
           } else if (kbContext == KB_CONTEXT_DEVICE_NAME) {
             leaveDeviceNameEntry();
+          } else if (kbContext == KB_CONTEXT_MSG_IP) {
+            openMessages();
+          } else if (kbContext == KB_CONTEXT_MSG_TEXT) {
+            currentScreen = SCREEN_CHAT;
+            drawChatScreen();
           } else {
             currentScreen = SCREEN_TODO;
             drawTodoScreen();
@@ -4065,6 +4602,30 @@ void loop() {
         currentScreen = SCREEN_SETTINGS;
         drawSettingsScreen();
       }
+      break;
+
+    case SCREEN_MESSAGES:
+      if (justTouched) {
+        if (touchedBack(touchX, touchY)) {
+          msgStatus[0] = '\0';
+          currentScreen = SCREEN_HOME;
+          drawHomeScreen(now);
+          lastDrawnMinute = now.minute();
+        } else {
+          handleMessagesTouch(touchX, touchY);
+        }
+      }
+      break;
+
+    case SCREEN_CHAT:
+      if (justTouched) {
+        if (touchedBack(touchX, touchY)) openMessages();
+        else handleChatTouch(touchX, touchY);
+      }
+      break;
+
+    case SCREEN_MSG_REQUEST:
+      if (justTouched) handleConnectPopupTouch(touchX, touchY);
       break;
 
     case SCREEN_TOUCH_CAL:
