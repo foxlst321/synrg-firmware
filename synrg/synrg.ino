@@ -13,6 +13,7 @@
 #include <FS.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <time.h>
 #include <esp_sntp.h>
 #include <WiFiClientSecure.h>
@@ -55,12 +56,14 @@
 // Arduino IDE's auto-generated prototypes can see them.
 #define DEVICE_NAME_MAX 20
 #define MSG_TEXT_MAX 60
+#define BUBBLE_CHARS 24        // characters per line in a chat bubble
+#define BUBBLE_MAX_LINES 5
 struct Contact { char name[DEVICE_NAME_MAX + 1]; char ip[16]; int unread; };
 struct MsgLine { char dir; char ip[16]; char when[9]; char text[MSG_TEXT_MAX + 1]; };
 
-enum KeyboardContext { KB_CONTEXT_NONE, KB_CONTEXT_ADD_TODO, KB_CONTEXT_ADD_HOMEWORK, KB_CONTEXT_WIFI_PASSWORD, KB_CONTEXT_DEVICE_NAME, KB_CONTEXT_MSG_IP, KB_CONTEXT_MSG_TEXT };
+enum KeyboardContext { KB_CONTEXT_NONE, KB_CONTEXT_ADD_TODO, KB_CONTEXT_ADD_HOMEWORK, KB_CONTEXT_WIFI_PASSWORD, KB_CONTEXT_DEVICE_NAME, KB_CONTEXT_MSG_IP };
 enum KeyboardMode { KB_MODE_ABC, KB_MODE_123, KB_MODE_SYM };
-enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM, SCREEN_TOUCH_CAL, SCREEN_MESSAGES, SCREEN_CHAT, SCREEN_MSG_REQUEST };
+enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM, SCREEN_TOUCH_CAL, SCREEN_MESSAGES, SCREEN_CHAT, SCREEN_MSG_REQUEST, SCREEN_NEARBY };
 enum SnakeDir { SNAKE_UP, SNAKE_DOWN, SNAKE_LEFT, SNAKE_RIGHT };
 enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME, MORE_ACTION_DEVICE_NAME, MORE_ACTION_TOUCH_CAL };
 
@@ -72,7 +75,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v2.9"
+#define FIRMWARE_VERSION "v3.0"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -1096,11 +1099,14 @@ void handleWebDeleteHomework() {
 // Wire protocol (plain HTTP on port 80):
 //   /msg/request?from=NAME        ask to connect
 //   /msg/accept?from=NAME         the other side said yes
-//   /msg/send?from=NAME&text=TXT  a message (contacts only)
+//   /msg/send?from=NAME&text=TXT  a message (contacts only; 410 = not a contact)
+// Finding people: "Find Nearby" broadcasts on UDP port 4210 and lists the
+// SynRGs that answer (only those with Messaging on); or type an IP.
 // Files: /msgon.txt (1/0), /contacts.txt (name|ip), /messages.txt
-// (dir|ip|time|text, newest MSG_KEEP kept).
+// (dir|ip|time|text, newest MSG_KEEP kept; dir i = received, o = sent,
+// f = failed to send, tap to retry).
 // ============================================================
-#define MSG_KEEP 40
+#define MSG_KEEP 60
 #define MAX_CONTACTS 8
 
 bool messagingOn = false;
@@ -1125,6 +1131,29 @@ Screen reqReturnScreen = SCREEN_HOME;
 
 // one-line notice shown on Home ("Hound Dog accepted", "New message from ...")
 char msgBanner[40] = "";
+
+// chat screen state
+bool chatTyping = false;           // keyboard open under the conversation
+int chatScroll = 0;                // how many of the newest messages are scrolled past
+bool chatCanScrollUp = false;
+int contactScroll = 0;
+#define CHAT_HIT_MAX 12
+int chatHitMsg[CHAT_HIT_MAX], chatHitY0[CHAT_HIT_MAX], chatHitY1[CHAT_HIT_MAX];
+int chatHitCount = 0;
+
+// pop-down notification banner
+bool bannerActive = false;
+unsigned long bannerUntilMs = 0;
+char bannerIp[16] = "";
+
+// nearby discovery
+#define DISCOVERY_PORT 4210
+#define MAX_NEARBY 6
+WiFiUDP discoveryUdp;
+bool discoveryUdpOn = false;
+Contact nearby[MAX_NEARBY];
+int nearbyCount = 0;
+bool nearbySearching = false;
 
 int totalUnread() {
   int n = 0;
@@ -1273,6 +1302,7 @@ int callPeer(const char* ip, const String& pathAndQuery) {
 void describePeerError(int code, const char* doing) {
   if (code == -100) snprintf(msgStatus, sizeof(msgStatus), "No WiFi");
   else if (code == 403) snprintf(msgStatus, sizeof(msgStatus), "They have messaging off");
+  else if (code == 410) snprintf(msgStatus, sizeof(msgStatus), "You're not in their contacts");
   else if (code == 404) snprintf(msgStatus, sizeof(msgStatus), "Not a SynRG with Messages");
   else if (code < 0) snprintf(msgStatus, sizeof(msgStatus), "Couldn't reach that IP");
   else snprintf(msgStatus, sizeof(msgStatus), "%s failed (%d)", doing, code);
@@ -1299,22 +1329,16 @@ void sendConnectRequest(const char* ip) {
 void sendChatMessage(const char* text) {
   if (chatContact < 0) return;
   Contact& c = contacts[chatContact];
-  strcpy(msgStatus, "Sending...");
-  drawChatScreen();
   int code = callPeer(c.ip, "/msg/send?from=" + urlEncode(deviceName) + "&text=" + urlEncode(text));
-  if (code == 200) {
-    addMessage('o', c.ip, text);
-    msgStatus[0] = '\0';
-  } else {
-    describePeerError(code, "Send");
-  }
+  // delivered -> 'o' (gets a tick); otherwise kept as 'f' so it can be retried
+  addMessage(code == 200 ? 'o' : 'f', c.ip, text);
 }
 
 // ---- incoming (web server handlers) ----
 bool canShowPopupNow() {
   return currentScreen == SCREEN_HOME || currentScreen == SCREEN_LOCK ||
-         currentScreen == SCREEN_MESSAGES || currentScreen == SCREEN_CHAT ||
-         currentScreen == SCREEN_SETTINGS;
+         currentScreen == SCREEN_MESSAGES || (currentScreen == SCREEN_CHAT && !chatTyping) ||
+         currentScreen == SCREEN_SETTINGS || currentScreen == SCREEN_NEARBY;
 }
 
 void refreshAfterIncoming() {
@@ -1356,22 +1380,28 @@ void handleMsgAccept() {
     snprintf(msgStatus, sizeof(msgStatus), "%s accepted!", contacts[idx].name);
   }
   refreshAfterIncoming();
+  if (idx >= 0) showBanner(contacts[idx].name, contacts[idx].ip, "accepted your request");
 }
 
 void handleMsgSend() {
   String ip = server.client().remoteIP().toString();
   int idx = findContactByIp(ip.c_str());
-  if (!messagingOn || idx < 0) { server.send(403, "text/plain", "not a contact"); return; }
+  if (!messagingOn) { server.send(403, "text/plain", "messaging off"); return; }
+  if (idx < 0) { server.send(410, "text/plain", "not a contact"); return; }
   if (!server.hasArg("text") || server.arg("text").length() == 0) { server.send(400, "text/plain", "missing text"); return; }
   if (server.hasArg("from") && server.arg("from").length())     // they may have renamed their PDA
     addOrUpdateContact(server.arg("from").c_str(), ip.c_str());
   addMessage('i', ip.c_str(), server.arg("text").c_str());
   server.send(200, "text/plain", "ok");
-  if (!(currentScreen == SCREEN_CHAT && chatContact == idx)) {
+  bool reading = (currentScreen == SCREEN_CHAT && chatContact == idx);
+  if (reading) {
+    chatScroll = 0;
+  } else {
     contacts[idx].unread++;
     snprintf(msgBanner, sizeof(msgBanner), "New message from %s", contacts[idx].name);
   }
   refreshAfterIncoming();
+  if (!reading) showBanner(contacts[idx].name, contacts[idx].ip, msgList[msgCount - 1].text);
 }
 
 // ---- connect pop-up ----
@@ -1404,6 +1434,7 @@ void handleConnectPopupTouch(int x, int y) {
     if (currentScreen == SCREEN_MESSAGES) drawMessagesScreen();
     else if (currentScreen == SCREEN_CHAT) drawChatScreen();
     else if (currentScreen == SCREEN_SETTINGS) drawSettingsScreen();
+    else if (currentScreen == SCREEN_NEARBY) drawNearbyScreen();
     else if (currentScreen == SCREEN_LOCK) drawLockScreen(clockNow());
     else { currentScreen = SCREEN_HOME; drawHomeScreen(clockNow()); }
     lastDrawnMinute = clockNow().minute();
@@ -1418,11 +1449,229 @@ void handleConnectPopupTouch(int x, int y) {
   }
 }
 
-// ---- Messages app: switch, contacts, New Chat ----
-const int CONTACT_Y = 70, CONTACT_H = 38, CONTACT_ROWS = 5;
+// ---- look & feel helpers: avatars, last-message previews ----
+uint16_t avatarColor(const char* name) {
+  unsigned h = 0;
+  for (const char* p = name; *p; p++) h = h * 31 + (unsigned char)*p;
+  return rgb565(customAccents[h % 8]);
+}
+
+// Colored circle with the contact's first letter.
+void drawAvatar(int cx, int cy, int r, const char* name) {
+  tft.fillCircle(cx, cy, r, avatarColor(name));
+  char letter = name[0] ? toupper((unsigned char)name[0]) : '?';
+  tft.setFont();
+  tft.setTextColor(ILI9341_WHITE);
+  if (r >= 12) { tft.setTextSize(2); tft.setCursor(cx - 5, cy - 7); }
+  else { tft.setTextSize(1); tft.setCursor(cx - 2, cy - 3); }
+  tft.print(letter);
+  tft.setTextSize(1);
+}
+
+// index in msgList of the newest message with this IP, or -1
+int lastMessageFor(const char* ip) {
+  for (int i = msgCount - 1; i >= 0; i--) if (strcmp(msgList[i].ip, ip) == 0) return i;
+  return -1;
+}
+
+// ---- notification banner: slides over the top of most screens for a few
+// seconds; tapping it opens that chat. ----
+bool bannerOkHere() {
+  switch (currentScreen) {
+    case SCREEN_LOCK: case SCREEN_HOME: case SCREEN_SETTINGS: case SCREEN_TODO:
+    case SCREEN_HOMEWORK: case SCREEN_MESSAGES: case SCREEN_CHAT: case SCREEN_NEARBY:
+    case SCREEN_THEMES: case SCREEN_THEME_CUSTOM: case SCREEN_MORE_ABOUT:
+    case SCREEN_KEYBOARD: case SCREEN_WEATHER: case SCREEN_SET_TIME: case SCREEN_SET_DATE:
+      return true;
+    default:
+      return false;   // Notes, Snake, updates etc. are never drawn over
+  }
+}
+
+void redrawCurrentScreen() {
+  switch (currentScreen) {
+    case SCREEN_LOCK:         drawLockScreen(clockNow()); break;
+    case SCREEN_HOME:         drawHomeScreen(clockNow()); break;
+    case SCREEN_SETTINGS:     drawSettingsScreen(); break;
+    case SCREEN_TODO:         drawTodoScreen(); break;
+    case SCREEN_HOMEWORK:     drawHomeworkScreen(); break;
+    case SCREEN_MESSAGES:     drawMessagesScreen(); break;
+    case SCREEN_CHAT:         drawChatScreen(); break;
+    case SCREEN_NEARBY:       drawNearbyScreen(); break;
+    case SCREEN_THEMES:       drawThemesScreen(); break;
+    case SCREEN_THEME_CUSTOM: drawThemeCustomScreen(); break;
+    case SCREEN_MORE_ABOUT:   drawMoreAboutScreen(); break;
+    case SCREEN_KEYBOARD:     drawKeyboardScreen(); break;
+    case SCREEN_WEATHER:      drawWeatherScreen(); break;
+    case SCREEN_SET_TIME:     drawSetTimeScreen(); break;
+    case SCREEN_SET_DATE:     drawSetDateScreen(); break;
+    default: break;
+  }
+}
+
+void showBanner(const char* name, const char* ip, const char* line) {
+  if (!bannerOkHere()) return;
+  strncpy(bannerIp, ip, sizeof(bannerIp) - 1);
+  bannerIp[sizeof(bannerIp) - 1] = '\0';
+  bannerActive = true;
+  bannerUntilMs = millis() + 4000;
+
+  // kept above y=41 so Home's ticking clock and icon animations don't draw over it
+  tft.fillRoundRect(4, 2, 232, 38, 12, COLOR_SURFACE);
+  tft.drawRoundRect(4, 2, 232, 38, 12, COLOR_ACCENT);
+  tft.drawRoundRect(5, 3, 230, 36, 11, COLOR_ACCENT);
+  drawAvatar(24, 21, 13, name);
+  tft.setFont();
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(46, 9);
+  tft.print(name);
+  char shown[30];
+  snprintf(shown, sizeof(shown), "%s", line);
+  tft.setTextColor(COLOR_SUBTEXT);
+  tft.setCursor(46, 24);
+  tft.print(shown);
+}
+
+// Called every loop(): hides the banner when its time is up.
+void updateBanner() {
+  if (!bannerActive || (long)(millis() - bannerUntilMs) < 0) return;
+  bannerActive = false;
+  if (bannerOkHere()) redrawCurrentScreen();
+}
+
+// A tap on the banner: open that conversation.
+void openBannerChat() {
+  bannerActive = false;
+  msgBanner[0] = '\0';
+  int idx = findContactByIp(bannerIp);
+  if (idx >= 0) openChat(idx);
+  else openMessages();
+}
+
+// ---- nearby discovery (like AirDrop): PDAs with Messaging on answer a
+// UDP broadcast "SYNRG?" on port 4210 with "SYNRG!<name>". ----
+void ensureDiscoveryUdp() {
+  if (discoveryUdpOn || WiFi.status() != WL_CONNECTED) return;
+  discoveryUdpOn = discoveryUdp.begin(DISCOVERY_PORT);
+}
+
+void sendDiscoveryQuery() {
+  IPAddress ip = WiFi.localIP(), mask = WiFi.subnetMask(), bcast;
+  for (int i = 0; i < 4; i++) bcast[i] = ip[i] | (uint8_t)~mask[i];
+  discoveryUdp.beginPacket(bcast, DISCOVERY_PORT);
+  discoveryUdp.print("SYNRG?");
+  discoveryUdp.endPacket();
+}
+
+// Reads one waiting discovery packet. Answers queries (when Messaging is
+// on); when `collect` is set, adds replies to the nearby list.
+void pollDiscovery(bool collect) {
+  ensureDiscoveryUdp();
+  if (!discoveryUdpOn) return;
+  int size = discoveryUdp.parsePacket();
+  if (size <= 0) return;
+  char buf[40];
+  int n = discoveryUdp.read(buf, sizeof(buf) - 1);
+  if (n < 0) n = 0;
+  buf[n] = '\0';
+  IPAddress from = discoveryUdp.remoteIP();
+  if (from == WiFi.localIP()) return;                       // our own broadcast
+
+  if (strcmp(buf, "SYNRG?") == 0) {
+    if (!messagingOn) return;
+    discoveryUdp.beginPacket(from, discoveryUdp.remotePort());
+    discoveryUdp.print("SYNRG!");
+    discoveryUdp.print(deviceName);
+    discoveryUdp.endPacket();
+  } else if (collect && strncmp(buf, "SYNRG!", 6) == 0) {
+    String ipStr = from.toString();
+    for (int i = 0; i < nearbyCount; i++) if (strcmp(nearby[i].ip, ipStr.c_str()) == 0) return;
+    if (nearbyCount >= MAX_NEARBY) return;
+    cleanMsgField(nearby[nearbyCount].name, sizeof(nearby[nearbyCount].name), buf[6] ? buf + 6 : "SynRG");
+    cleanMsgField(nearby[nearbyCount].ip, sizeof(nearby[nearbyCount].ip), ipStr.c_str());
+    nearby[nearbyCount].unread = 0;
+    nearbyCount++;
+  }
+}
+
+void scanNearby() {
+  nearbyCount = 0;
+  nearbySearching = true;
+  drawNearbyScreen();
+  ensureDiscoveryUdp();
+  if (discoveryUdpOn) {
+    unsigned long start = millis();
+    int sent = 0;
+    while (millis() - start < 1800) {
+      if (sent < 3 && millis() - start >= (unsigned long)sent * 500) { sendDiscoveryQuery(); sent++; }
+      pollDiscovery(true);
+      delay(10);
+    }
+  }
+  nearbySearching = false;
+  drawNearbyScreen();
+}
+
+void openNearby() {
+  currentScreen = SCREEN_NEARBY;
+  scanNearby();
+}
+
+void drawNearbyScreen() {
+  tft.fillScreen(COLOR_BG);
+  drawScreenFrame();
+  drawBackBar("Nearby");
+
+  if (nearbySearching) {
+    printCentered(&FreeSansBold12pt7b, 120, 120, "Searching...", COLOR_TEXT);
+    printCentered(&FreeSans9pt7b, 120, 156, "Looking for SynRGs", COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 176, "with Messaging on", COLOR_SUBTEXT);
+    return;
+  }
+  if (nearbyCount == 0) {
+    printCentered(&FreeSansBold12pt7b, 120, 100, "Nobody found", COLOR_TEXT);
+    printCentered(&FreeSans9pt7b, 120, 136, "They need Messaging on", COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 156, "and the same WiFi.", COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 186, "Or go back and use By IP.", COLOR_SUBTEXT);
+  }
+  for (int i = 0; i < nearbyCount; i++) {
+    int y = 32 + i * 40;
+    drawGlassRect(8, y, 224, 34, 12, COLOR_SURFACE);
+    drawAvatar(26, y + 17, 13, nearby[i].name);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(46, y + 7);
+    tft.print(nearby[i].name);
+    tft.setTextColor(COLOR_SUBTEXT);
+    tft.setCursor(46, y + 20);
+    tft.print(nearby[i].ip);
+    if (findContactByIp(nearby[i].ip) >= 0) { tft.setCursor(180, y + 20); tft.print("contact"); }
+  }
+  drawGlassRect(20, 278, 200, 34, 16, COLOR_BLUE);
+  printFitted(&FreeSansBold12pt7b, 120, 287, "Search Again", ILI9341_WHITE, 188);
+}
+
+void handleNearbyTouch(int x, int y) {
+  if (x >= 20 && x <= 220 && y >= 278 && y <= 312) { scanNearby(); return; }
+  for (int i = 0; i < nearbyCount; i++) {
+    int ry = 32 + i * 40;
+    if (y >= ry && y <= ry + 34) {
+      char ip[16];
+      strcpy(ip, nearby[i].ip);
+      openMessages();
+      sendConnectRequest(ip);                 // opens the chat if already a contact
+      if (currentScreen == SCREEN_MESSAGES) drawMessagesScreen();
+      return;
+    }
+  }
+}
+
+// ---- Messages app: switch, contact list, Find Nearby / By IP ----
+const int CONTACT_Y = 66, CONTACT_H = 38, CONTACT_ROWS = 5;
 
 void openMessages() {
   chatConfirmDelete = false;
+  chatTyping = false;
   chatContact = -1;
   currentScreen = SCREEN_MESSAGES;
   drawMessagesScreen();
@@ -1433,38 +1682,69 @@ void drawMessagesScreen() {
   drawScreenFrame();
   drawBackBar("Messages");
 
-  drawGlassRect(8, 30, 224, 32, 12, messagingOn ? COLOR_ACCENT : COLOR_SUBTEXT);
-  printFitted(&FreeSansBold12pt7b, 120, 38, messagingOn ? "Messaging: On" : "Messaging: Off", ILI9341_WHITE, 210);
+  drawGlassRect(8, 30, 224, 30, 12, messagingOn ? COLOR_ACCENT : COLOR_SUBTEXT);
+  printFitted(&FreeSansBold12pt7b, 120, 37, messagingOn ? "Messaging: On" : "Messaging: Off", ILI9341_WHITE, 210);
+
+  if (contactScroll > contactCount - CONTACT_ROWS) contactScroll = contactCount - CONTACT_ROWS;
+  if (contactScroll < 0) contactScroll = 0;
 
   if (contactCount == 0) {
     printCentered(&FreeSans9pt7b, 120, 110, "No contacts yet", COLOR_SUBTEXT);
-    printCentered(&FreeSans9pt7b, 120, 134, "Tap New Chat and type", COLOR_SUBTEXT);
-    printCentered(&FreeSans9pt7b, 120, 154, "the other PDA's IP", COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 134, "Tap Find Nearby to see", COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 154, "other SynRGs on this WiFi", COLOR_SUBTEXT);
   }
-  for (int i = 0; i < contactCount && i < CONTACT_ROWS; i++) {
-    int y = CONTACT_Y + i * CONTACT_H;
+  for (int row = 0; row < CONTACT_ROWS && row + contactScroll < contactCount; row++) {
+    Contact& c = contacts[row + contactScroll];
+    int y = CONTACT_Y + row * CONTACT_H;
     drawGlassRect(8, y, 224, 34, 12, COLOR_SURFACE);
-    tft.setFont(&FreeSansBold9pt7b);
-    tft.setTextSize(1);
+    drawAvatar(26, y + 17, 13, c.name);
+
+    int last = lastMessageFor(c.ip);
     tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(18, y + 16);
-    tft.print(contacts[i].name);
-    tft.setFont();
+    if (strlen(c.name) <= 11) {
+      tft.setFont(&FreeSansBold9pt7b);
+      tft.setCursor(46, y + 15);
+      tft.print(c.name);
+      tft.setFont();
+    } else {
+      tft.setCursor(46, y + 6);
+      tft.print(c.name);
+    }
     tft.setTextColor(COLOR_SUBTEXT);
-    tft.setCursor(18, y + 22);
-    tft.print(contacts[i].ip);
-    if (contacts[i].unread > 0) {
-      tft.fillCircle(214, y + 17, 8, COLOR_ERROR);
+    if (last >= 0) {
+      // time of the last message, top right
+      tft.setCursor(226 - strlen(msgList[last].when) * 6, y + 6);
+      tft.print(msgList[last].when);
+      char preview[25];
+      snprintf(preview, sizeof(preview), "%s%s", msgList[last].dir == 'i' ? "" : "You: ", msgList[last].text);
+      if (c.unread > 0) tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(46, y + 22);
+      tft.print(preview);
+    } else {
+      tft.setCursor(46, y + 22);
+      tft.print(c.ip);
+    }
+    if (c.unread > 0) {
+      tft.fillCircle(218, y + 24, 7, COLOR_ERROR);
       tft.setTextColor(ILI9341_WHITE);
-      tft.setCursor(contacts[i].unread > 9 ? 209 : 212, y + 14);
-      tft.print(contacts[i].unread > 9 ? 9 : contacts[i].unread);
+      tft.setCursor(216, y + 21);
+      tft.print(c.unread > 9 ? 9 : c.unread);
     }
   }
 
-  if (msgStatus[0]) printCentered(&FreeSans9pt7b, 120, 256, msgStatus, COLOR_SUBTEXT);
+  // status line, with scroll arrows when there are more contacts than rows
+  bool canScroll = contactCount > CONTACT_ROWS;
+  if (msgStatus[0]) printFitted(&FreeSans9pt7b, canScroll ? 96 : 120, 260, msgStatus, COLOR_SUBTEXT, canScroll ? 180 : 224);
+  if (canScroll) {
+    tft.fillTriangle(196, 272, 204, 260, 212, 272, contactScroll > 0 ? COLOR_TEXT : COLOR_FRAME);
+    tft.fillTriangle(218, 260, 226, 272, 234, 260, contactScroll < contactCount - CONTACT_ROWS ? COLOR_TEXT : COLOR_FRAME);
+  }
 
-  drawGlassRect(20, 276, 200, 36, 16, messagingOn ? COLOR_BLUE : COLOR_SUBTEXT);
-  printFitted(&FreeSansBold12pt7b, 120, 286, "+ New Chat", ILI9341_WHITE, 188);
+  uint16_t btn = messagingOn ? COLOR_BLUE : COLOR_SUBTEXT;
+  drawGlassRect(8, 280, 124, 32, 14, btn);
+  printFitted(&FreeSansBold12pt7b, 70, 288, "Find Nearby", ILI9341_WHITE, 116);
+  drawGlassRect(140, 280, 92, 32, 14, btn);
+  printFitted(&FreeSansBold12pt7b, 186, 288, "By IP", ILI9341_WHITE, 84);
 }
 
 void startMsgKeyboard(KeyboardContext ctx, const char* prefill, KeyboardMode mode) {
@@ -1479,29 +1759,37 @@ void startMsgKeyboard(KeyboardContext ctx, const char* prefill, KeyboardMode mod
 }
 
 void handleMessagesTouch(int x, int y) {
-  if (y >= 30 && y <= 62) {                                    // on/off switch
+  if (y >= 30 && y <= 60) {                                    // on/off switch
     messagingOn = !messagingOn;
     saveMessagingOn();
     msgStatus[0] = '\0';
     drawMessagesScreen();
     return;
   }
-  if (x >= 20 && x <= 220 && y >= 276 && y <= 312) {           // New Chat
+  if (y >= 280 && y <= 312) {                                  // Find Nearby / By IP
     if (!messagingOn) { strcpy(msgStatus, "Turn Messaging on first"); drawMessagesScreen(); return; }
     msgStatus[0] = '\0';
-    startMsgKeyboard(KB_CONTEXT_MSG_IP, newChatIp, KB_MODE_123);
+    if (x >= 8 && x <= 132) {
+      if (WiFi.status() != WL_CONNECTED) { strcpy(msgStatus, "No WiFi"); drawMessagesScreen(); return; }
+      openNearby();
+    } else if (x >= 140 && x <= 232) {
+      startMsgKeyboard(KB_CONTEXT_MSG_IP, newChatIp, KB_MODE_123);
+    }
     return;
   }
-  for (int i = 0; i < contactCount && i < CONTACT_ROWS; i++) {
-    int ry = CONTACT_Y + i * CONTACT_H;
-    if (y >= ry && y <= ry + 34) { openChat(i); return; }
+  if (contactCount > CONTACT_ROWS && y >= 254 && y <= 278 && x >= 190) {   // scroll arrows
+    if (x < 215 && contactScroll > 0) contactScroll--;
+    else if (x >= 215 && contactScroll < contactCount - CONTACT_ROWS) contactScroll++;
+    drawMessagesScreen();
+    return;
+  }
+  for (int row = 0; row < CONTACT_ROWS && row + contactScroll < contactCount; row++) {
+    int ry = CONTACT_Y + row * CONTACT_H;
+    if (y >= ry && y <= ry + 34) { openChat(row + contactScroll); return; }
   }
 }
 
 // ---- chat with one contact ----
-const int CHAT_ROWS = 6, CHAT_Y = 30, CHAT_ROW_H = 36;
-
-
 // Removes a contact and erases the conversation with them.
 void deleteContact(int idx) {
   if (idx < 0 || idx >= contactCount) return;
@@ -1517,6 +1805,8 @@ void deleteContact(int idx) {
 
 void openChat(int idx) {
   chatConfirmDelete = false;
+  chatTyping = false;
+  chatScroll = 0;
   chatContact = idx;
   contacts[idx].unread = 0;
   msgStatus[0] = '\0';
@@ -1524,49 +1814,188 @@ void openChat(int idx) {
   drawChatScreen();
 }
 
+// Splits a message into lines of at most BUBBLE_CHARS, breaking at a space
+// when there is one in the second half of the line. Returns the line count.
+int wrapMessage(const char* text, char lines[BUBBLE_MAX_LINES][BUBBLE_CHARS + 1]) {
+  int n = 0;
+  int len = strlen(text);
+  int pos = 0;
+  while (pos < len && n < BUBBLE_MAX_LINES) {
+    int remaining = len - pos;
+    int take = remaining;
+    int skip = 0;
+    if (remaining > BUBBLE_CHARS) {
+      take = BUBBLE_CHARS;
+      for (int k = BUBBLE_CHARS; k >= BUBBLE_CHARS / 2; k--) {
+        if (text[pos + k] == ' ') { take = k; skip = 1; break; }
+      }
+    }
+    memcpy(lines[n], text + pos, take);
+    lines[n][take] = '\0';
+    n++;
+    pos += take + skip;
+  }
+  if (n == 0) { lines[0][0] = '\0'; n = 1; }
+  return n;
+}
+
+// Draws the conversation between y=top and y=bottom, newest at the bottom,
+// skipping the newest `chatScroll` messages. Bubbles fit their text, have a
+// little tail, and the time sits under the last bubble of each group.
+void drawChatMessages(int top, int bottom) {
+  Contact& c = contacts[chatContact];
+  int idx[MSG_KEEP];
+  int total = 0;
+  for (int i = 0; i < msgCount; i++) if (strcmp(msgList[i].ip, c.ip) == 0) idx[total++] = i;
+  if (chatScroll > total - 1) chatScroll = total > 0 ? total - 1 : 0;
+
+  chatHitCount = 0;
+  chatCanScrollUp = false;
+  tft.setFont();
+  tft.setTextSize(1);
+  if (total == 0) { printCentered(&FreeSans9pt7b, 120, (top + bottom) / 2 - 8, "Say hi!", COLOR_SUBTEXT); return; }
+
+  int y = bottom;
+  char lines[BUBBLE_MAX_LINES][BUBBLE_CHARS + 1];
+  for (int k = total - 1 - chatScroll; k >= 0; k--) {
+    MsgLine& m = msgList[idx[k]];
+    bool out = (m.dir != 'i');
+    bool failed = (m.dir == 'f');
+    int n = wrapMessage(m.text, lines);
+    int widest = 1;
+    for (int l = 0; l < n; l++) if ((int)strlen(lines[l]) > widest) widest = strlen(lines[l]);
+    int w = widest * 6 + 14, h = n * 10 + 8;
+
+    // time row: under the last bubble of a run from the same side & minute
+    bool showTime = failed || (k == total - 1);
+    if (!showTime) {
+      MsgLine& next = msgList[idx[k + 1]];
+      showTime = ((next.dir != 'i') != out) || strcmp(next.when, m.when) != 0 || next.dir == 'f';
+    }
+    int need = h + (showTime ? 11 : 0) + 4;
+    if (y - need < top) { chatCanScrollUp = true; break; }
+    y -= need;
+
+    int x = out ? 232 - w : 8;
+    uint16_t fill = out ? COLOR_ACCENT : COLOR_SURFACE;
+    tft.fillRoundRect(x, y, w, h, 8, fill);
+    if (out) tft.fillTriangle(x + w - 10, y + h - 1, x + w - 1, y + h - 8, x + w + 4, y + h + 2, fill);
+    else {
+      tft.drawRoundRect(x, y, w, h, 8, COLOR_FRAME);
+      tft.fillTriangle(x + 10, y + h - 1, x + 1, y + h - 8, x - 4, y + h + 2, fill);
+    }
+    tft.setTextColor(out ? ILI9341_WHITE : COLOR_TEXT);
+    for (int l = 0; l < n; l++) { tft.setCursor(x + 7, y + 5 + l * 10); tft.print(lines[l]); }
+
+    if (failed) {                                   // red "!" beside the bubble
+      tft.fillCircle(x - 10, y + h / 2, 6, COLOR_ERROR);
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setCursor(x - 12, y + h / 2 - 3);
+      tft.print("!");
+    } else if (out) {                               // delivered tick
+      tft.drawLine(x - 12, y + h - 8, x - 9, y + h - 5, COLOR_ACCENT);
+      tft.drawLine(x - 9, y + h - 5, x - 4, y + h - 11, COLOR_ACCENT);
+    }
+    if (showTime) {
+      const char* label = failed ? "Not sent - tap to retry" : m.when;
+      tft.setTextColor(failed ? COLOR_ERROR : COLOR_SUBTEXT);
+      tft.setCursor(out ? 220 - (int)strlen(label) * 6 : 20, y + h + 2);
+      tft.print(label);
+    }
+    if (chatHitCount < CHAT_HIT_MAX) {
+      chatHitMsg[chatHitCount] = idx[k];
+      chatHitY0[chatHitCount] = y;
+      chatHitY1[chatHitCount] = y + h + (showTime ? 11 : 0);
+      chatHitCount++;
+    }
+  }
+}
+
+// the text box above the keyboard while typing
+void drawChatInput() {
+  tft.fillRoundRect(8, 98, 224, 24, 8, COLOR_SURFACE);
+  tft.drawRoundRect(8, 98, 224, 24, 8, COLOR_ACCENT);
+  tft.setFont();
+  tft.setTextSize(1);
+  if (kbBufferLen == 0) {
+    tft.setTextColor(COLOR_SUBTEXT);
+    tft.setCursor(16, 106);
+    tft.print("Message...");
+    return;
+  }
+  const int showMax = 30;
+  const char* shown = kbBufferLen > showMax ? kbBuffer + (kbBufferLen - showMax) : kbBuffer;
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(16, 106);
+  tft.print(shown);
+  char count[8];
+  snprintf(count, sizeof(count), "%d", MSG_TEXT_MAX - kbBufferLen);
+  tft.setTextColor(COLOR_SUBTEXT);
+  tft.setCursor(226 - strlen(count) * 6, 106);
+  tft.print(count);
+}
+
+// the half-height keyboard under the chat
+void drawChatKeyboard() {
+  tft.fillRect(2, 124, 236, 194, COLOR_BG);
+  bool upper = (kbMode == KB_MODE_ABC) && kbShift;
+  drawKeyRow(kbGetRow1(), 126, 32, upper);
+  drawKeyRow(kbGetRow2(), 162, 32, upper);
+  drawKeyRow(kbGetRow3(), 198, 32, upper);
+
+  const char* pageLabel = "123";
+  if (kbMode == KB_MODE_123) pageLabel = "#+=";
+  else if (kbMode == KB_MODE_SYM) pageLabel = "ABC";
+  drawGlassRect(8, 234, 70, 32, 12, COLOR_SETTINGS);
+  printFitted(&FreeSansBold12pt7b, 43, 242, pageLabel, ILI9341_WHITE, 60);
+  drawGlassRect(86, 234, 70, 32, 12, kbShift ? COLOR_ACCENT : COLOR_SUBTEXT);
+  printFitted(&FreeSansBold12pt7b, 121, 242, "SHIFT", ILI9341_WHITE, 60);
+  drawGlassRect(164, 234, 70, 32, 12, COLOR_SUBTEXT);
+  printFitted(&FreeSansBold12pt7b, 199, 242, "DEL", ILI9341_WHITE, 60);
+
+  drawGlassRect(4, 272, 136, 40, 14, COLOR_SETTINGS);
+  printFitted(&FreeSansBold12pt7b, 72, 284, "SPACE", ILI9341_WHITE, 124);
+  drawGlassRect(148, 272, 88, 40, 14, COLOR_ACCENT);
+  printFitted(&FreeSansBold12pt7b, 192, 284, "SEND", ILI9341_WHITE, 78);
+}
+
 void drawChatScreen() {
   if (chatContact < 0 || chatContact >= contactCount) { openMessages(); return; }
   Contact& c = contacts[chatContact];
   tft.fillScreen(COLOR_BG);
   drawScreenFrame();
-  drawBackBar(c.name);
+
+  // header: back arrow, avatar, name with the IP under it, Delete
+  tft.fillRect(0, 0, 240, 36, COLOR_STATUSBAR);
+  tft.setFont();
+  tft.setTextSize(2);
   tft.setTextColor(ILI9341_WHITE);
-  tft.setCursor(196, 8);
+  tft.setCursor(8, 10);
+  tft.print("<");
+  tft.setTextSize(1);
+  drawAvatar(42, 18, 13, c.name);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(62, 7);
+  tft.print(c.name);
+  tft.setCursor(62, 21);
+  tft.print(c.ip);
+  tft.setCursor(198, 14);
   tft.print("Delete");
 
-  // the newest CHAT_ROWS messages with this contact, oldest at the top
-  int idxs[CHAT_ROWS];
-  int n = 0;
-  for (int i = msgCount - 1; i >= 0 && n < CHAT_ROWS; i--)
-    if (strcmp(msgList[i].ip, c.ip) == 0) idxs[n++] = i;
-
-  if (n == 0) printCentered(&FreeSans9pt7b, 120, 120, "Say hi!", COLOR_SUBTEXT);
-  for (int k = 0; k < n; k++) {
-    MsgLine& m = msgList[idxs[n - 1 - k]];
-    int y = CHAT_Y + k * CHAT_ROW_H;
-    bool out = (m.dir == 'o');
-    int bx = out ? 40 : 8;
-    drawGlassRect(bx, y, 192, 32, 10, out ? COLOR_ACCENT : COLOR_SURFACE);
-    tft.setFont();
-    tft.setTextSize(1);
-    tft.setTextColor(out ? ILI9341_WHITE : COLOR_TEXT);
-    // up to two lines of 30 characters
-    char line1[31], line2[31];
-    snprintf(line1, sizeof(line1), "%s", m.text);
-    snprintf(line2, sizeof(line2), "%s", strlen(m.text) > 30 ? m.text + 30 : "");
-    tft.setCursor(bx + 8, y + 6);
-    tft.print(line1);
-    tft.setCursor(bx + 8, y + 17);
-    tft.print(line2);
-    tft.setTextColor(out ? ILI9341_WHITE : COLOR_SUBTEXT);
-    tft.setCursor(bx + 192 - 8 - strlen(m.when) * 6, y + 24);
-    tft.print(m.when);
+  if (chatTyping) {
+    drawChatMessages(40, 96);
+    drawChatInput();
+    drawChatKeyboard();
+  } else {
+    drawChatMessages(40, 266);
+    drawGlassRect(8, 272, 156, 40, 16, COLOR_ACCENT);
+    printFitted(&FreeSansBold12pt7b, 86, 284, "Write", ILI9341_WHITE, 146);
+    // scroll arrows: older / newer
+    drawGlassRect(170, 272, 30, 40, 12, chatCanScrollUp ? COLOR_SETTINGS : COLOR_FRAME);
+    tft.fillTriangle(177, 298, 185, 284, 193, 298, ILI9341_WHITE);
+    drawGlassRect(204, 272, 30, 40, 12, chatScroll > 0 ? COLOR_SETTINGS : COLOR_FRAME);
+    tft.fillTriangle(211, 286, 219, 300, 227, 286, ILI9341_WHITE);
   }
-
-  if (msgStatus[0]) printCentered(&FreeSans9pt7b, 120, 252, msgStatus, COLOR_SUBTEXT);
-
-  drawGlassRect(20, 272, 200, 40, 16, COLOR_ACCENT);
-  printFitted(&FreeSansBold12pt7b, 120, 284, "Write Message", ILI9341_WHITE, 188);
 
   if (chatConfirmDelete) {
     tft.fillRoundRect(16, 84, 208, 150, 18, COLOR_SHADOW);
@@ -1580,6 +2009,69 @@ void drawChatScreen() {
     printFitted(&FreeSansBold12pt7b, 70, 184, "Keep", ILI9341_WHITE, 80);
     drawGlassRect(122, 170, 88, 44, 16, COLOR_ERROR);
     printFitted(&FreeSansBold12pt7b, 166, 184, "Delete", ILI9341_WHITE, 80);
+  }
+}
+
+// Tries a failed message again; on success it becomes a normal sent message.
+void retryMessage(int msgIndex) {
+  MsgLine& m = msgList[msgIndex];
+  if (m.dir != 'f') return;
+  int code = callPeer(m.ip, "/msg/send?from=" + urlEncode(deviceName) + "&text=" + urlEncode(m.text));
+  if (code == 200) {
+    m.dir = 'o';
+    DateTime now = clockNow();
+    formatTime12h(m.when, now.hour(), now.minute());
+    saveMessages();
+  }
+  drawChatScreen();
+}
+
+void handleChatTypingTouch(int x, int y) {
+  char c = hitTestKeyRow(kbGetRow1(), x, y, 126, 32);
+  if (!c) c = hitTestKeyRow(kbGetRow2(), x, y, 162, 32);
+  if (!c) c = hitTestKeyRow(kbGetRow3(), x, y, 198, 32);
+  if (c) {
+    if (kbBufferLen < MSG_TEXT_MAX) {
+      if (kbMode == KB_MODE_ABC && kbShift) c = toupper(c);
+      kbBuffer[kbBufferLen++] = c;
+      kbBuffer[kbBufferLen] = '\0';
+      drawChatInput();                         // only the text box redraws: fast typing
+    }
+    return;
+  }
+  if (y >= 234 && y <= 266) {
+    if (x >= 8 && x <= 78) {                                   // page: ABC -> 123 -> #+=
+      kbMode = (kbMode == KB_MODE_ABC) ? KB_MODE_123 : (kbMode == KB_MODE_123 ? KB_MODE_SYM : KB_MODE_ABC);
+      drawChatKeyboard();
+    } else if (x >= 86 && x <= 156) {                          // SHIFT
+      kbShift = !kbShift;
+      drawChatKeyboard();
+    } else if (x >= 164 && x <= 234 && kbBufferLen > 0) {      // DEL
+      kbBuffer[--kbBufferLen] = '\0';
+      drawChatInput();
+    }
+    return;
+  }
+  if (y >= 272 && y <= 312) {
+    if (x >= 4 && x <= 140) {                                  // SPACE
+      if (kbBufferLen < MSG_TEXT_MAX) {
+        kbBuffer[kbBufferLen++] = ' ';
+        kbBuffer[kbBufferLen] = '\0';
+        drawChatInput();
+      }
+    } else if (x >= 148 && x <= 236 && kbBufferLen > 0) {      // SEND
+      char text[MSG_TEXT_MAX + 1];
+      strcpy(text, kbBuffer);
+      kbBuffer[0] = '\0';
+      kbBufferLen = 0;
+      tft.fillRoundRect(8, 98, 224, 24, 8, COLOR_SURFACE);
+      tft.setTextColor(COLOR_SUBTEXT);
+      tft.setCursor(16, 106);
+      tft.print("Sending...");
+      sendChatMessage(text);
+      chatScroll = 0;
+      drawChatScreen();
+    }
   }
 }
 
@@ -1598,14 +2090,41 @@ void handleChatTouch(int x, int y) {
     }
     return;
   }
-  if (x >= 180 && y < 32) {                                    // "Delete" in the top bar
-    chatConfirmDelete = true;
-    drawChatScreen();
+  if (y < 40) {                                                // header
+    if (x < 60) {                                              // back: close keyboard first
+      if (chatTyping) { chatTyping = false; drawChatScreen(); }
+      else openMessages();
+    } else if (x >= 188) {
+      chatConfirmDelete = true;
+      drawChatScreen();
+    }
     return;
   }
-  if (x >= 20 && x <= 220 && y >= 272 && y <= 312) {
-    msgStatus[0] = '\0';
-    startMsgKeyboard(KB_CONTEXT_MSG_TEXT, "", KB_MODE_ABC);
+  // a failed message: tap it to try again
+  for (int i = 0; i < chatHitCount; i++) {
+    if (y >= chatHitY0[i] && y <= chatHitY1[i] && msgList[chatHitMsg[i]].dir == 'f') {
+      retryMessage(chatHitMsg[i]);
+      return;
+    }
+  }
+  if (chatTyping) { handleChatTypingTouch(x, y); return; }
+
+  if (y >= 272 && y <= 312) {
+    if (x >= 8 && x <= 164) {                                  // Write: keyboard slides in
+      kbBuffer[0] = '\0';
+      kbBufferLen = 0;
+      kbMode = KB_MODE_ABC;
+      kbShift = false;
+      chatTyping = true;
+      chatScroll = 0;
+      drawChatScreen();
+    } else if (x >= 170 && x <= 200 && chatCanScrollUp) {      // older
+      chatScroll += 3;
+      drawChatScreen();
+    } else if (x >= 204 && x <= 234 && chatScroll > 0) {       // newer
+      chatScroll = chatScroll > 3 ? chatScroll - 3 : 0;
+      drawChatScreen();
+    }
   }
 }
 
@@ -1913,7 +2432,6 @@ int kbMaxLen() {
   if (kbContext == KB_CONTEXT_ADD_TODO) return 35;
   if (kbContext == KB_CONTEXT_DEVICE_NAME) return DEVICE_NAME_MAX;
   if (kbContext == KB_CONTEXT_MSG_IP) return 15;
-  if (kbContext == KB_CONTEXT_MSG_TEXT) return MSG_TEXT_MAX;
   return 36;
 }
 
@@ -1924,7 +2442,6 @@ void drawKeyboardScreen() {
   if (kbContext == KB_CONTEXT_WIFI_PASSWORD) title = "WiFi Password";
   if (kbContext == KB_CONTEXT_DEVICE_NAME) title = "Name Your Device";
   if (kbContext == KB_CONTEXT_MSG_IP) title = "Send To (IP)";
-  if (kbContext == KB_CONTEXT_MSG_TEXT) title = "New Message";
   drawBackBar(title);
 
   tft.fillRoundRect(10, 30, 220, 40, 12, COLOR_SURFACE);
@@ -2060,10 +2577,6 @@ void handleKeyboardTouch(int x, int y) {
         sendConnectRequest(newChatIp);
         if (currentScreen == SCREEN_MESSAGES) drawMessagesScreen();
       }
-    } else if (kbContext == KB_CONTEXT_MSG_TEXT) {
-      currentScreen = SCREEN_CHAT;
-      if (kbBufferLen > 0) sendChatMessage(kbBuffer);
-      drawChatScreen();
     } else {
       currentScreen = SCREEN_TODO;
       drawTodoScreen();
@@ -4459,6 +4972,12 @@ void loop() {
   }
 
   runWebRequests();
+  pollDiscovery(false);
+  updateBanner();
+  if (bannerActive && justTouched && touchY < 44) {   // tapped the banner
+    openBannerChat();
+    justTouched = false;
+  }
   if (reqPending && currentScreen != SCREEN_MSG_REQUEST && canShowPopupNow()) showConnectPopup();
 
   wasTouched = touchedNow;
@@ -4572,9 +5091,6 @@ void loop() {
             leaveDeviceNameEntry();
           } else if (kbContext == KB_CONTEXT_MSG_IP) {
             openMessages();
-          } else if (kbContext == KB_CONTEXT_MSG_TEXT) {
-            currentScreen = SCREEN_CHAT;
-            drawChatScreen();
           } else {
             currentScreen = SCREEN_TODO;
             drawTodoScreen();
@@ -4671,9 +5187,13 @@ void loop() {
       break;
 
     case SCREEN_CHAT:
+      if (justTouched) handleChatTouch(touchX, touchY);
+      break;
+
+    case SCREEN_NEARBY:
       if (justTouched) {
         if (touchedBack(touchX, touchY)) openMessages();
-        else handleChatTouch(touchX, touchY);
+        else handleNearbyTouch(touchX, touchY);
       }
       break;
 
