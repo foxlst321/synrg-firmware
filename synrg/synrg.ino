@@ -72,7 +72,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v2.8"
+#define FIRMWARE_VERSION "v2.9"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -1111,6 +1111,7 @@ int contactCount = 0;
 MsgLine msgList[MSG_KEEP];
 int msgCount = 0;
 
+bool chatConfirmDelete = false;   // "Delete this contact?" pop-up showing
 int chatContact = -1;              // contact open in the chat screen
 char msgStatus[40] = "";
 char msgOutgoingIp[16] = "";       // we asked this IP to connect, waiting for Accept
@@ -1421,6 +1422,7 @@ void handleConnectPopupTouch(int x, int y) {
 const int CONTACT_Y = 70, CONTACT_H = 38, CONTACT_ROWS = 5;
 
 void openMessages() {
+  chatConfirmDelete = false;
   chatContact = -1;
   currentScreen = SCREEN_MESSAGES;
   drawMessagesScreen();
@@ -1499,7 +1501,22 @@ void handleMessagesTouch(int x, int y) {
 // ---- chat with one contact ----
 const int CHAT_ROWS = 6, CHAT_Y = 30, CHAT_ROW_H = 36;
 
+
+// Removes a contact and erases the conversation with them.
+void deleteContact(int idx) {
+  if (idx < 0 || idx >= contactCount) return;
+  int kept = 0;
+  for (int i = 0; i < msgCount; i++)
+    if (strcmp(msgList[i].ip, contacts[idx].ip) != 0) msgList[kept++] = msgList[i];
+  msgCount = kept;
+  saveMessages();
+  for (int i = idx; i < contactCount - 1; i++) contacts[i] = contacts[i + 1];
+  contactCount--;
+  saveContacts();
+}
+
 void openChat(int idx) {
+  chatConfirmDelete = false;
   chatContact = idx;
   contacts[idx].unread = 0;
   msgStatus[0] = '\0';
@@ -1513,6 +1530,9 @@ void drawChatScreen() {
   tft.fillScreen(COLOR_BG);
   drawScreenFrame();
   drawBackBar(c.name);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(196, 8);
+  tft.print("Delete");
 
   // the newest CHAT_ROWS messages with this contact, oldest at the top
   int idxs[CHAT_ROWS];
@@ -1547,9 +1567,42 @@ void drawChatScreen() {
 
   drawGlassRect(20, 272, 200, 40, 16, COLOR_ACCENT);
   printFitted(&FreeSansBold12pt7b, 120, 284, "Write Message", ILI9341_WHITE, 188);
+
+  if (chatConfirmDelete) {
+    tft.fillRoundRect(16, 84, 208, 150, 18, COLOR_SHADOW);
+    tft.fillRoundRect(14, 80, 208, 150, 18, COLOR_SURFACE);
+    tft.drawRoundRect(14, 80, 208, 150, 18, COLOR_ERROR);
+    char q[40];
+    snprintf(q, sizeof(q), "Delete %s?", c.name);
+    printFitted(&FreeSansBold12pt7b, 118, 98, q, COLOR_TEXT, 196);
+    printCentered(&FreeSans9pt7b, 118, 130, "Your chat is erased too", COLOR_SUBTEXT);
+    drawGlassRect(26, 170, 88, 44, 16, COLOR_SUBTEXT);
+    printFitted(&FreeSansBold12pt7b, 70, 184, "Keep", ILI9341_WHITE, 80);
+    drawGlassRect(122, 170, 88, 44, 16, COLOR_ERROR);
+    printFitted(&FreeSansBold12pt7b, 166, 184, "Delete", ILI9341_WHITE, 80);
+  }
 }
 
 void handleChatTouch(int x, int y) {
+  if (chatConfirmDelete) {
+    if (y >= 170 && y <= 214 && x >= 122 && x <= 210) {        // Delete
+      char gone[DEVICE_NAME_MAX + 1];
+      strcpy(gone, contacts[chatContact].name);
+      deleteContact(chatContact);
+      openMessages();
+      snprintf(msgStatus, sizeof(msgStatus), "Deleted %s", gone);
+      drawMessagesScreen();
+    } else if (y >= 170 && y <= 214 && x >= 26 && x <= 114) {  // Keep
+      chatConfirmDelete = false;
+      drawChatScreen();
+    }
+    return;
+  }
+  if (x >= 180 && y < 32) {                                    // "Delete" in the top bar
+    chatConfirmDelete = true;
+    drawChatScreen();
+    return;
+  }
   if (x >= 20 && x <= 220 && y >= 272 && y <= 312) {
     msgStatus[0] = '\0';
     startMsgKeyboard(KB_CONTEXT_MSG_TEXT, "", KB_MODE_ABC);
