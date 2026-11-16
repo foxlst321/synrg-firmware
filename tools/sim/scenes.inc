@@ -87,4 +87,45 @@ void runScenes() {
   drawBootScreen(); shot("jensen_boot");
   openChat(0); shot("jensen_chat");
   settingsCategory = -1; currentScreen = SCREEN_SETTINGS; drawSettingsScreen(); shot("jensen_settings");
+
+  // ---- News: run sample RSS through the real parser ----
+  currentTheme = THEME_OLED; applyTheme(currentTheme);
+  { const char* feeds[3] = {
+      "<rss><channel><title>NPR Top</title><item><title>Senate passes spending bill after late-night session, avoiding a government shutdown</title><link>x</link></item>"
+      "<item><title><![CDATA[Storm brings heavy snow &amp; ice to the Midwest]]></title></item>"
+      "<item><title>What we know about the bridge closure</title></item></channel></rss>",
+      "<rss><channel><title>Tech</title><item>\n  <title>Chipmakers race to build faster AI processors as demand keeps climbing worldwide this year</title></item>"
+      "<item><title>Why your phone\xE2\x80\x99s battery drains faster in the cold</title></item>"
+      "<item><title>A new &#8220;smart&#8221; glasses rival arrives</title></item></channel></rss>",
+      "<rss><channel><item><title>Lions win in overtime thriller</title></item><item><title>World Cup draw: what to watch for</title></item></channel></rss>" };
+    int cats[3] = {0, 1, 5};
+    for (int f = 0; f < 3; f++) {
+      newsCount[cats[f]] = 0; newsParserReset();
+      for (const char* p = feeds[f]; *p; p++) newsParserFeed(*p, cats[f]);
+    }
+    newsMask = 0x23; buildNewsMix(); strcpy(newsStatus, "Updated 10:42 AM"); }
+  openNews(); shot("news");
+  tap(120, 41); shot("news_tech_off");       // toggle Tech chip off
+  tap(120, 41);
+  currentScreen = SCREEN_HOME; drawHomeScreen(clockNow()); shot("home_ticker0");
+  for (int i = 0; i < 60; i++) { simMillis += 45; updateNewsTicker(); }
+  shot("home_ticker1");
+  for (int i = 0; i < 120; i++) { simMillis += 45; updateNewsTicker(); }
+  shot("home_ticker2");
+  newsMask = 0; buildNewsMix(); drawHomeScreen(clockNow()); shot("home_ticker_empty");
+  newsMask = 0x23; buildNewsMix();
+  tap(120, 295); shot("news_from_ticker");   // tapping the ticker opens News
+  currentTheme = 0; applyTheme(0); currentScreen = SCREEN_HOME; drawHomeScreen(clockNow()); shot("home_ticker_nook");
+
+  // Jensen theme switches on the hidden Nvidia topic (Google News style titles)
+  { const char* feed = "<rss><channel><title>\"Nvidia\" - Google News</title><item><title>Nvidia unveils next-generation AI chips at keynote - Reuters</title></item>"
+      "<item><title>Jensen Huang says demand for AI computing is &#39;incredible&#39; - CNBC</title></item></channel></rss>";
+    newsCount[NEWS_CAT_NVIDIA] = 0; newsParserReset();
+    for (const char* p = feed; *p; p++) newsParserFeed(*p, NEWS_CAT_NVIDIA); }
+  currentTheme = THEME_SECRET; applyTheme(currentTheme);
+  openNews(); shot("news_jensen");
+  currentScreen = SCREEN_HOME; drawHomeScreen(clockNow());
+  for (int i = 0; i < 90; i++) { simMillis += 45; updateNewsTicker(); }
+  shot("home_ticker_jensen");
+  currentTheme = THEME_OLED; applyTheme(currentTheme); openNews(); shot("news_after_jensen");
 }

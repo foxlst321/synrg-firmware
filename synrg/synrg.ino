@@ -66,7 +66,7 @@ struct MsgLine { char dir; char ip[16]; char when[9]; char text[MSG_TEXT_MAX + 1
 
 enum KeyboardContext { KB_CONTEXT_NONE, KB_CONTEXT_ADD_TODO, KB_CONTEXT_ADD_HOMEWORK, KB_CONTEXT_WIFI_PASSWORD, KB_CONTEXT_DEVICE_NAME, KB_CONTEXT_MSG_IP };
 enum KeyboardMode { KB_MODE_ABC, KB_MODE_123, KB_MODE_SYM };
-enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM, SCREEN_TOUCH_CAL, SCREEN_MESSAGES, SCREEN_CHAT, SCREEN_MSG_REQUEST, SCREEN_NEARBY };
+enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM, SCREEN_TOUCH_CAL, SCREEN_MESSAGES, SCREEN_CHAT, SCREEN_MSG_REQUEST, SCREEN_NEARBY, SCREEN_NEWS };
 enum SnakeDir { SNAKE_UP, SNAKE_DOWN, SNAKE_LEFT, SNAKE_RIGHT };
 enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME, MORE_ACTION_DEVICE_NAME, MORE_ACTION_TOUCH_CAL };
 
@@ -78,7 +78,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v3.4"
+#define FIRMWARE_VERSION "v3.5"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -721,9 +721,9 @@ int settingsCategory = -1;
 // The wide widget sits under the status bar; below it are six app tiles in
 // two columns. Tile 0 is the widget (it has its own WIDGET_* box).
 const int WIDGET_X = 14, WIDGET_Y = 30, WIDGET_W = 212, WIDGET_H = 66;
-const int tileW = 104, tileH = 60;
+const int tileW = 104, tileH = 56;
 const int col0 = 14, col1 = 122;
-const int row0 = 104, row1 = 170, row2 = 236;
+const int row0 = 104, row1 = 166, row2 = 228;
 #define TILE_COUNT 7
 #define TILE_MESSAGES 6
 #define TILE_ICON_R 15
@@ -1210,6 +1210,7 @@ Screen reqReturnScreen = SCREEN_HOME;
 
 // one-line notice shown on Home ("Hound Dog accepted", "New message from ...")
 char msgBanner[40] = "";
+bool newsTickerDirty = true;       // the Home news ticker text needs rebuilding
 
 // chat screen state
 bool chatTyping = false;           // keyboard open under the conversation
@@ -1558,7 +1559,7 @@ int lastMessageFor(const char* ip) {
 bool bannerOkHere() {
   switch (currentScreen) {
     case SCREEN_LOCK: case SCREEN_HOME: case SCREEN_SETTINGS: case SCREEN_TODO:
-    case SCREEN_HOMEWORK: case SCREEN_MESSAGES: case SCREEN_CHAT: case SCREEN_NEARBY:
+    case SCREEN_HOMEWORK: case SCREEN_MESSAGES: case SCREEN_CHAT: case SCREEN_NEARBY: case SCREEN_NEWS:
     case SCREEN_THEMES: case SCREEN_THEME_CUSTOM: case SCREEN_MORE_ABOUT:
     case SCREEN_KEYBOARD: case SCREEN_WEATHER: case SCREEN_SET_TIME: case SCREEN_SET_DATE:
       return true;
@@ -1577,6 +1578,7 @@ void redrawCurrentScreen() {
     case SCREEN_MESSAGES:     drawMessagesScreen(); break;
     case SCREEN_CHAT:         drawChatScreen(); break;
     case SCREEN_NEARBY:       drawNearbyScreen(); break;
+    case SCREEN_NEWS:         drawNewsScreen(); break;
     case SCREEN_THEMES:       drawThemesScreen(); break;
     case SCREEN_THEME_CUSTOM: drawThemeCustomScreen(); break;
     case SCREEN_MORE_ABOUT:   drawMoreAboutScreen(); break;
@@ -2214,6 +2216,442 @@ void handleChatTouch(int x, int y) {
   }
 }
 
+// ============================================================
+// NEWS -- headlines from NPR's public RSS feeds, by topic. Pick any mix of
+// topics in the News app; the chosen ones are blended together in the list
+// and in the scrolling ticker at the bottom of the Home screen.
+// Feeds are read as a stream (never held whole in memory): only the
+// <title> of each <item> is kept. Settings live in /news.txt as
+// "topicMask,tickerOn".
+// ============================================================
+#define NEWS_CHIPS 6                   // topics you can pick in the News app
+#define NEWS_CATS 7                    // ...plus the hidden Nvidia topic
+#define NEWS_CAT_NVIDIA 6
+#define NEWS_PER_CAT 6
+#define NEWS_TITLE_MAX 110
+struct NewsCat { const char* name; const char* url; };
+const NewsCat newsCats[NEWS_CATS] = {
+  {"Top",      "https://feeds.npr.org/1001/rss.xml"},
+  {"Tech",     "https://feeds.npr.org/1019/rss.xml"},
+  {"Politics", "https://feeds.npr.org/1014/rss.xml"},
+  {"Business", "https://feeds.npr.org/1006/rss.xml"},
+  {"Science",  "https://feeds.npr.org/1007/rss.xml"},
+  {"Sports",   "https://feeds.npr.org/1055/rss.xml"},
+  // Only while the secret Jensen theme is active: a Google News search for
+  // Nvidia / Jensen Huang, blended in ahead of the other topics.
+  {"Nvidia",   "https://news.google.com/rss/search?q=Nvidia+OR+%22Jensen+Huang%22&hl=en-US&gl=US&ceid=US:en"},
+};
+char newsTitles[NEWS_CATS][NEWS_PER_CAT][NEWS_TITLE_MAX + 1];
+int newsCount[NEWS_CATS] = {0, 0, 0, 0, 0, 0, 0};
+unsigned long newsNextTryMs[NEWS_CATS] = {0, 0, 0, 0, 0, 0, 0};   // when each topic may be fetched again
+int newsMixTheme = -1;                 // theme the blended list was built for
+uint8_t newsMask = 0x03;               // which topics are on (bit per topic); default Top + Tech
+bool newsTickerOn = true;
+char newsStatus[40] = "";
+int newsScroll = 0;
+
+// the blended list: (topic, index) pairs, taking turns between topics
+uint8_t newsMixCat[NEWS_CATS * NEWS_PER_CAT], newsMixIdx[NEWS_CATS * NEWS_PER_CAT];
+int newsMixCount = 0;
+
+uint16_t newsCatColor(int cat) {
+  if (cat == NEWS_CAT_NVIDIA) return tft.color565(118, 185, 0);
+  return rgb565(customAccents[(cat * 3 + 1) % 8]);
+}
+
+// Is this topic switched on? The six normal ones follow the chips; the
+// Nvidia topic follows the Jensen theme.
+bool newsCatOn(int cat) {
+  if (cat == NEWS_CAT_NVIDIA) return currentTheme == THEME_SECRET;
+  return newsMask & (1 << cat);
+}
+bool anyNewsCatOn() {
+  for (int c = 0; c < NEWS_CATS; c++) if (newsCatOn(c)) return true;
+  return false;
+}
+
+void loadNewsSettings() {
+  if (!LittleFS.exists("/news.txt")) return;
+  File f = LittleFS.open("/news.txt");
+  if (!f) return;
+  char buf[12];
+  int i = 0;
+  while (f.available() && i < 11) buf[i++] = f.read();
+  buf[i] = '\0';
+  f.close();
+  int m = 3, t = 1;
+  sscanf(buf, "%d,%d", &m, &t);
+  newsMask = m & 0x3F;
+  newsTickerOn = (t != 0);
+}
+
+void saveNewsSettings() {
+  LittleFS.remove("/news.txt");
+  File f = LittleFS.open("/news.txt", FILE_WRITE);
+  if (f) { f.printf("%d,%d", newsMask, newsTickerOn ? 1 : 0); f.close(); }
+}
+
+void buildNewsMix() {
+  newsMixCount = 0;
+  newsMixTheme = currentTheme;
+  for (int i = 0; i < NEWS_PER_CAT; i++)
+    for (int k = 0; k < NEWS_CATS; k++) {
+      int c = (k + NEWS_CAT_NVIDIA) % NEWS_CATS;            // Nvidia first, then Top, Tech, ...
+      if (newsCatOn(c) && i < newsCount[c]) { newsMixCat[newsMixCount] = c; newsMixIdx[newsMixCount] = i; newsMixCount++; }
+    }
+  newsTickerDirty = true;
+}
+
+// Turns raw feed text into plain ASCII: drops CDATA wrappers, decodes the
+// common &entities;, and maps curly quotes / dashes to plain ones.
+void cleanNewsTitle(const char* raw, char* out, size_t outLen) {
+  size_t j = 0;
+  bool lastSpace = true;
+  for (size_t i = 0; raw[i] && j < outLen - 1; ) {
+    char c = raw[i];
+    if (strncmp(raw + i, "<![CDATA[", 9) == 0) { i += 9; continue; }
+    if (strncmp(raw + i, "]]>", 3) == 0) { i += 3; continue; }
+    if (c == '&') {
+      const char* semi = strchr(raw + i, ';');
+      if (semi && semi - (raw + i) <= 8) {
+        char ent[10];
+        size_t n = semi - (raw + i) - 1;
+        memcpy(ent, raw + i + 1, n); ent[n] = '\0';
+        if (!strcmp(ent, "amp")) c = '&';
+        else if (!strcmp(ent, "quot")) c = '"';
+        else if (!strcmp(ent, "apos")) c = '\'';
+        else if (!strcmp(ent, "lt")) c = '<';
+        else if (!strcmp(ent, "gt")) c = '>';
+        else if (ent[0] == '#') {
+          int v = (ent[1] == 'x' || ent[1] == 'X') ? (int)strtol(ent + 2, NULL, 16) : atoi(ent + 1);
+          if (v == 8216 || v == 8217) c = '\'';
+          else if (v == 8220 || v == 8221) c = '"';
+          else if (v == 8211 || v == 8212) c = '-';
+          else c = (v >= 32 && v < 127) ? (char)v : ' ';
+        } else c = ' ';
+        i = (semi - raw) + 1;
+      } else i++;
+    } else if ((unsigned char)c == 0xE2 && (unsigned char)raw[i + 1] == 0x80 && raw[i + 2]) {
+      unsigned char k = raw[i + 2];                  // UTF-8 curly quotes and dashes
+      c = (k == 0x98 || k == 0x99) ? '\'' : (k == 0x9C || k == 0x9D) ? '"' : (k == 0x93 || k == 0x94) ? '-' : ' ';
+      i += 3;
+    } else if ((unsigned char)c >= 0x80) {           // any other non-ASCII byte
+      i++;
+      continue;
+    } else i++;
+    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    if (c == ' ' && lastSpace) continue;
+    lastSpace = (c == ' ');
+    out[j++] = c;
+  }
+  while (j > 0 && out[j - 1] == ' ') j--;
+  out[j] = '\0';
+}
+
+// ---- streaming RSS reader: feed it one character at a time ----
+char newsWin[10];                    // the last few characters seen
+int newsParseState = 0;              // 0 = before an <item>, 1 = in item before <title, 2 = in the <title ...> tag, 3 = reading the title
+char newsRaw[260];
+int newsRawLen = 0;
+
+void newsParserReset() { memset(newsWin, 0, sizeof(newsWin)); newsParseState = 0; newsRawLen = 0; }
+
+bool newsWinEnds(const char* tail) {
+  size_t n = strlen(tail);
+  return memcmp(newsWin + 9 - n, tail, n) == 0;
+}
+
+// Returns true once the topic has all the headlines it can hold.
+bool newsParserFeed(char c, int cat) {
+  memmove(newsWin, newsWin + 1, 8);
+  newsWin[8] = c;
+  switch (newsParseState) {
+    case 0: if (newsWinEnds("<item")) newsParseState = 1; break;
+    case 1: if (newsWinEnds("<title")) newsParseState = 2; break;
+    case 2: if (c == '>') { newsParseState = 3; newsRawLen = 0; } break;
+    case 3:
+      if (newsRawLen < (int)sizeof(newsRaw) - 1) newsRaw[newsRawLen++] = c;
+      if (newsWinEnds("</title>")) {
+        newsRawLen = newsRawLen >= 8 ? newsRawLen - 8 : 0;
+        newsRaw[newsRawLen] = '\0';
+        cleanNewsTitle(newsRaw, newsTitles[cat][newsCount[cat]], NEWS_TITLE_MAX + 1);
+        if (newsTitles[cat][newsCount[cat]][0]) newsCount[cat]++;
+        newsParseState = 0;
+      }
+      break;
+  }
+  return newsCount[cat] >= NEWS_PER_CAT;
+}
+
+// Downloads one topic's feed. Blocks for a second or two.
+bool fetchNewsCategory(int cat) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.useHTTP10(true);                        // plain (non-chunked) body, so it can be read as a stream
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(8000);
+  http.begin(client, String(newsCats[cat].url));
+  int code = http.GET();
+  bool ok = false;
+  if (code == 200) {
+    int kept = newsCount[cat];
+    newsCount[cat] = 0;
+    newsParserReset();
+    WiFiClient* stream = http.getStreamPtr();
+    unsigned long start = millis(), lastData = millis();
+    bool full = false;
+    while (!full && millis() - start < 15000 && millis() - lastData < 5000) {
+      if (stream->available() > 0) {
+        full = newsParserFeed((char)stream->read(), cat);
+        lastData = millis();
+      } else if (!http.connected()) break;
+      else delay(2);
+    }
+    ok = newsCount[cat] > 0;
+    if (!ok) newsCount[cat] = 0;
+    (void)kept;
+  }
+  http.end();
+  // fresh for 30 minutes; after a failure try again in 5
+  newsNextTryMs[cat] = millis() + (ok ? 30UL * 60UL * 1000UL : 5UL * 60UL * 1000UL);
+  buildNewsMix();
+  return ok;
+}
+
+// Quietly keeps the chosen topics fresh while the PDA sits on Home or Lock:
+// at most one topic every 15 seconds, so the screen never freezes for long.
+unsigned long newsLastAutoMs = 0;
+void newsAutoRefresh(bool touching) {
+  if (touching || !anyNewsCatOn() || WiFi.status() != WL_CONNECTED) return;
+  if (currentScreen != SCREEN_HOME && currentScreen != SCREEN_LOCK) return;
+  if (millis() < 20000 || millis() - newsLastAutoMs < 15000) return;
+  for (int c = 0; c < NEWS_CATS; c++) {
+    if (!newsCatOn(c)) continue;
+    if (newsNextTryMs[c] != 0 && (long)(millis() - newsNextTryMs[c]) < 0) continue;
+    newsLastAutoMs = millis();
+    fetchNewsCategory(c);
+    newsLastAutoMs = millis();
+    return;
+  }
+}
+
+// ---- Home ticker: headlines sliding right-to-left along the bottom of the
+// Home screen. Drawn into an off-screen strip first, so it doesn't flicker. ----
+const int TICKER_X = 4, TICKER_Y = 288, TICKER_W = 232, TICKER_H = 15;
+GFXcanvas16 tickerCanvas(TICKER_W, TICKER_H);
+char newsTickerText[1500];
+int newsTickerTextW = 0;
+int newsTickerPos = 0;
+unsigned long newsTickerMs = 0;
+
+void rebuildTickerText() {
+  newsTickerDirty = false;
+  newsTickerText[0] = '\0';
+  size_t len = 0;
+  for (int i = 0; i < newsMixCount && i < 12; i++) {
+    const char* t = newsTitles[newsMixCat[i]][newsMixIdx[i]];
+    int n = snprintf(newsTickerText + len, sizeof(newsTickerText) - len, "%s      ", t);
+    if (n < 0 || len + n >= sizeof(newsTickerText)) break;
+    len += n;
+  }
+  tickerCanvas.setFont(&SynSmall);
+  tickerCanvas.setTextWrap(false);
+  int16_t x1, y1; uint16_t tw, th;
+  tickerCanvas.getTextBounds(newsTickerText, 0, 0, &x1, &y1, &tw, &th);
+  newsTickerTextW = tw;
+  newsTickerPos = 0;
+}
+
+void drawNewsTicker() {
+  if (newsMixTheme != currentTheme) buildNewsMix();     // the Jensen theme adds / removes the Nvidia topic
+  if (newsTickerDirty) rebuildTickerText();
+  const int labelW = 42;
+  tickerCanvas.fillScreen(COLOR_SURFACE);
+  tickerCanvas.setFont(&SynSmall);
+  tickerCanvas.setTextWrap(false);
+  tickerCanvas.setTextColor(COLOR_TEXT);
+  if (newsMixCount == 0) {
+    tickerCanvas.setTextColor(COLOR_SUBTEXT);
+    tickerCanvas.setCursor(labelW + 6, 11);
+    tickerCanvas.print(!anyNewsCatOn() ? "Tap to choose topics" : WiFi.status() == WL_CONNECTED ? "Getting headlines..." : "Waiting for WiFi");
+  } else {
+    tickerCanvas.setCursor(TICKER_W - newsTickerPos, 11);
+    tickerCanvas.print(newsTickerText);
+  }
+  tickerCanvas.fillRect(0, 0, labelW, TICKER_H, COLOR_ACCENT);      // fixed "NEWS" label the text slides under
+  tickerCanvas.setFont(&SynSmallBold);
+  tickerCanvas.setTextColor(ILI9341_WHITE);
+  tickerCanvas.setCursor(4, 11);
+  tickerCanvas.print("NEWS");
+  tft.drawRGBBitmap(TICKER_X, TICKER_Y, tickerCanvas.getBuffer(), TICKER_W, TICKER_H);
+}
+
+// Called every loop() on Home: slides the ticker along.
+void updateNewsTicker() {
+  if (!newsTickerOn || msgBanner[0]) return;
+  if (millis() - newsTickerMs < 40) return;
+  newsTickerMs = millis();
+  if (newsMixCount == 0 && !newsTickerDirty) {
+    static unsigned long lastIdleDraw = 0;               // nothing to scroll: just refresh the message now and then
+    if (millis() - lastIdleDraw < 2000) return;
+    lastIdleDraw = millis();
+  }
+  newsTickerPos += 2;
+  if (newsTickerPos > TICKER_W + newsTickerTextW) newsTickerPos = 0;
+  drawNewsTicker();
+}
+
+// ---- News app ----
+const int NEWS_LIST_Y = 88, NEWS_ROW_H = 28, NEWS_ROWS = 6;
+
+void openNews() {
+  newsScroll = 0;
+  newsStatus[0] = '\0';
+  currentScreen = SCREEN_NEWS;
+  drawNewsScreen();
+}
+
+// Wraps `text` into at most two lines no wider than maxW pixels (small UI
+// font); the second line ends in "..." when the headline is longer.
+void wrapTwoLines(const char* text, int maxW, char* l1, char* l2, size_t len) {
+  tft.setFont();
+  tft.setTextSize(1);
+  int16_t x1, y1; uint16_t tw, th;
+  size_t n = strlen(text), cut = n;
+  char tmp[NEWS_TITLE_MAX + 4];
+  // longest prefix ending at a word break that fits on line 1
+  for (size_t i = 0; i <= n; i++) {
+    if (text[i] != ' ' && text[i] != '\0') continue;
+    size_t k = i < sizeof(tmp) - 1 ? i : sizeof(tmp) - 1;
+    memcpy(tmp, text, k); tmp[k] = '\0';
+    tft.getTextBounds(tmp, 0, 0, &x1, &y1, &tw, &th);
+    if ((int)tw > maxW) break;
+    cut = i;
+  }
+  if (cut == n && n > 0) {                       // fits (or one unbreakable word): all on line 1
+    tft.getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
+    if ((int)tw <= maxW) { snprintf(l1, len, "%s", text); l2[0] = '\0'; return; }
+    cut = n * maxW / (tw + 1);
+  }
+  size_t k = cut < len - 1 ? cut : len - 1;
+  memcpy(l1, text, k); l1[k] = '\0';
+  const char* rest = text + cut;
+  while (*rest == ' ') rest++;
+  snprintf(l2, len, "%s", rest);
+  for (;;) {                                     // trim line 2 until it fits, adding "..."
+    tft.getTextBounds(l2, 0, 0, &x1, &y1, &tw, &th);
+    size_t m = strlen(l2);
+    if ((int)tw <= maxW || m < 5) break;
+    char* sp = strrchr(l2, ' ');
+    size_t at = (sp && sp > l2 + 4) ? (size_t)(sp - l2) : m - 4;
+    if (at + 4 > len) at = len - 4;
+    strcpy(l2 + at, "...");
+    if (m == strlen(l2)) { l2[m - 4] = '\0'; strcat(l2, "..."); if (m <= 8) break; }
+  }
+}
+
+void drawNewsScreen() {
+  tft.fillScreen(COLOR_BG);
+  drawScreenFrame();
+  drawBackBar("News");
+  if (newsMixTheme != currentTheme) buildNewsMix();
+
+  // topic chips: tap to turn each one on or off
+  for (int c = 0; c < NEWS_CHIPS; c++) {
+    int x = 8 + (c % 3) * 76, y = 30 + (c / 3) * 28;
+    bool on = newsMask & (1 << c);
+    drawGlassRect(x, y, 72, 23, 11, on ? newsCatColor(c) : COLOR_SURFACE);
+    printFitted(&SynSmallBold, x + 36, y + 6, newsCats[c].name, on ? ILI9341_WHITE : COLOR_SUBTEXT, 66);
+  }
+
+  int maxScroll = newsMixCount > NEWS_ROWS ? newsMixCount - NEWS_ROWS : 0;
+  if (newsScroll > maxScroll) newsScroll = maxScroll;
+  if (newsMixCount == 0) {
+    const char* msg = !anyNewsCatOn() ? "Pick at least one topic above" : "No headlines yet - tap Refresh";
+    printCentered(&FreeSans9pt7b, 120, 150, msg, COLOR_SUBTEXT);
+  }
+  char l1[NEWS_TITLE_MAX + 1], l2[NEWS_TITLE_MAX + 1];
+  for (int row = 0; row < NEWS_ROWS && row + newsScroll < newsMixCount; row++) {
+    int cat = newsMixCat[row + newsScroll];
+    int y = NEWS_LIST_Y + row * NEWS_ROW_H;
+    tft.fillRoundRect(8, y, 4, 23, 2, newsCatColor(cat));            // topic color stripe
+    wrapTwoLines(newsTitles[cat][newsMixIdx[row + newsScroll]], 212, l1, l2, sizeof(l1));
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(18, y + (l2[0] ? 0 : 6));
+    tft.print(l1);
+    if (l2[0]) { tft.setCursor(18, y + 12); tft.print(l2); }
+  }
+
+  // status line + scroll arrows
+  tft.setFont();
+  tft.setTextColor(COLOR_SUBTEXT);
+  tft.setCursor(10, 262);
+  tft.print(newsStatus[0] ? newsStatus : currentTheme == THEME_SECRET ? "NPR + Nvidia news" : "Headlines from NPR");
+  if (maxScroll > 0) {
+    tft.fillTriangle(196, 274, 204, 262, 212, 274, newsScroll > 0 ? COLOR_TEXT : COLOR_FRAME);
+    tft.fillTriangle(218, 262, 226, 274, 234, 262, newsScroll < maxScroll ? COLOR_TEXT : COLOR_FRAME);
+  }
+
+  drawGlassRect(8, 282, 110, 30, 14, newsTickerOn ? COLOR_ACCENT : COLOR_SUBTEXT);
+  printFitted(&FreeSansBold9pt7b, 63, 290, newsTickerOn ? "Ticker: On" : "Ticker: Off", ILI9341_WHITE, 102);
+  drawGlassRect(124, 282, 108, 30, 14, COLOR_BLUE);
+  printFitted(&FreeSansBold9pt7b, 178, 290, "Refresh", ILI9341_WHITE, 100);
+}
+
+void refreshAllNews() {
+  if (WiFi.status() != WL_CONNECTED) { strcpy(newsStatus, "No WiFi"); drawNewsScreen(); return; }
+  int ok = 0, tried = 0;
+  for (int c = 0; c < NEWS_CATS; c++) {
+    if (!newsCatOn(c)) continue;
+    snprintf(newsStatus, sizeof(newsStatus), "Updating %s...", newsCats[c].name);
+    drawNewsScreen();
+    tried++;
+    if (fetchNewsCategory(c)) ok++;
+  }
+  if (tried == 0) strcpy(newsStatus, "Pick a topic first");
+  else if (ok == tried) {
+    DateTime now = clockNow();
+    char t12[9];
+    formatTime12h(t12, now.hour(), now.minute());
+    snprintf(newsStatus, sizeof(newsStatus), "Updated %s", t12);
+  } else snprintf(newsStatus, sizeof(newsStatus), "Couldn't load %d of %d topics", tried - ok, tried);
+  newsScroll = 0;
+  drawNewsScreen();
+}
+
+void handleNewsTouch(int x, int y) {
+  for (int c = 0; c < NEWS_CHIPS; c++) {                             // topic chips
+    int cx = 8 + (c % 3) * 76, cy = 30 + (c / 3) * 28;
+    if (x >= cx && x <= cx + 72 && y >= cy && y <= cy + 23) {
+      newsMask ^= (1 << c);
+      saveNewsSettings();
+      buildNewsMix();
+      newsScroll = 0;
+      newsStatus[0] = '\0';
+      drawNewsScreen();
+      return;
+    }
+  }
+  if (y >= 282 && y <= 312) {
+    if (x >= 8 && x <= 118) {                                        // ticker on/off
+      newsTickerOn = !newsTickerOn;
+      saveNewsSettings();
+      drawNewsScreen();
+    } else if (x >= 124 && x <= 232) {
+      refreshAllNews();
+    }
+    return;
+  }
+  int maxScroll = newsMixCount > NEWS_ROWS ? newsMixCount - NEWS_ROWS : 0;
+  if (maxScroll > 0 && y >= 256 && y <= 280 && x >= 190) {            // scroll arrows
+    if (x < 215) newsScroll = newsScroll > 3 ? newsScroll - 3 : 0;
+    else newsScroll = newsScroll + 3 < maxScroll ? newsScroll + 3 : maxScroll;
+    drawNewsScreen();
+  }
+}
+
 // ---- Device controls on the web page, so the PDA can still be calibrated,
 // updated or restarted when its touch isn't working. The heavy work runs in
 // loop() after the browser has had its reply. ----
@@ -2392,7 +2830,7 @@ void iconGrid(int cx, int cy, uint16_t color) {
 
 void drawTileIcon(int i, int radius) {
   int cx = tileX[i] + tileW / 2;
-  int cy = tileY[i] + 23;
+  int cy = tileY[i] + 21;
   tft.fillRect(cx - 18, cy - 18, 37, 37, tileColors[i]);
   tft.fillCircle(cx, cy, radius, ILI9341_WHITE);
   switch (i) {
@@ -2918,7 +3356,7 @@ void buildIpText(char* buf, size_t len) {
   }
 }
 
-int ipLineY() { return currentScreen == SCREEN_LOCK ? 296 : 302; }
+int ipLineY() { return currentScreen == SCREEN_LOCK ? 296 : 306; }
 
 void drawIpLine() {
   buildIpText(shownIpText, sizeof(shownIpText));
@@ -3384,14 +3822,15 @@ void drawHomeScreen(DateTime now) {
     drawTileIcon(i, TILE_ICON_R);
   }
   drawIpLine();
+  if (newsTickerOn && !msgBanner[0]) drawNewsTicker();
   if (msgBanner[0]) {                 // "Hound Dog accepted!" / "New message from ..."
-    tft.fillRoundRect(20, 299, 200, 17, 8, COLOR_ACCENT);
+    tft.fillRoundRect(20, 287, 200, 17, 8, COLOR_ACCENT);
     tft.setFont();
     tft.setTextSize(1);
     tft.setTextColor(ILI9341_WHITE);
     int16_t x1, y1; uint16_t tw, th;
     tft.getTextBounds(msgBanner, 0, 0, &x1, &y1, &tw, &th);
-    tft.setCursor(120 - tw / 2, 302);
+    tft.setCursor(120 - tw / 2, 290);
     tft.print(msgBanner);
   }
 }
@@ -3402,6 +3841,10 @@ void handleHomeTouch(int x, int y) {
     currentScreen = SCREEN_LOCK;
     drawLockScreen(now);
     lastDrawnMinute = now.minute();
+    return;
+  }
+  if (y >= 286 && y <= 305 && !msgBanner[0]) {     // the news ticker opens the News app
+    openNews();
     return;
   }
   for (int i = 1; i < TILE_COUNT; i++) {
@@ -5281,6 +5724,7 @@ void setup() {
   loadDeviceName();
   loadTouchCal();
   loadMessaging();
+  loadNewsSettings();
   tft.setRotation(displayRotation);
 
   char hostname[33];
@@ -5406,6 +5850,8 @@ void loop() {
   runWebRequests();
   pollDiscovery(false);
   updateBanner();
+  if (currentScreen == SCREEN_HOME) updateNewsTicker();
+  newsAutoRefresh(touchedNow);
   if (bannerActive && justTouched && touchY < 44) {   // tapped the banner
     openBannerChat();
     justTouched = false;
@@ -5632,6 +6078,18 @@ void loop() {
 
     case SCREEN_CHAT:
       if (justTouched) handleChatTouch(touchX, touchY);
+      break;
+
+    case SCREEN_NEWS:
+      if (justTouched) {
+        if (touchedBack(touchX, touchY)) {
+          currentScreen = SCREEN_HOME;
+          drawHomeScreen(now);
+          lastDrawnMinute = now.minute();
+        } else {
+          handleNewsTouch(touchX, touchY);
+        }
+      }
       break;
 
     case SCREEN_NEARBY:

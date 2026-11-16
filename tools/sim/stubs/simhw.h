@@ -113,7 +113,7 @@ struct WiFiUDP : Print {
 };
 #define HTTPC_STRICT_FOLLOW_REDIRECTS 1
 struct HTTPClient {
-  void setTimeout(int) {} void setFollowRedirects(int) {}
+  void setTimeout(int) {} void setFollowRedirects(int) {} void useHTTP10(bool) {}
   template <class C> bool begin(C&, const String&) { return true; }
   int GET() { return -1; } void end() {}
   String getString() { return String(""); } int getSize() { return 0; }
