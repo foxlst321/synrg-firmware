@@ -27,3 +27,7 @@
   of package_esp32_index.json, libraries via git clone, then compile the
   output of `tools/sim/mkproto.py` (plus `synrg/*.h`) with
   `--build-property runtime.tools.ctags.path=/usr/bin`.
+- Local firmware builds: always compile with `--clean` into a fresh output
+  directory, then check the binary with `strings` for the new version AND
+  a string unique to the change. arduino-cli's cache once reused a stale
+  build (this container's clock jumps), producing an old firmware.bin.
