@@ -78,7 +78,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v3.3"
+#define FIRMWARE_VERSION "v3.4"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -208,7 +208,9 @@ void saveHomeWidget(int w) {
 // ---- Themes: every screen draws with the COLOR_* globals, so a theme just
 // swaps that whole palette at once. Six presets plus a Custom theme built
 // from a Light/Dark base and an accent color. Saved to /theme.txt as
-// "theme,customBase,customAccent" so it survives a power cycle. ----
+// "theme,customBase,customAccent,2" so it survives a power cycle. The
+// trailing 2 marks the numbering used since v3.4 (when OLED was added in
+// front of Custom); files without it are converted once on load. ----
 const Theme themes[] = {
   {"Nook",     {250,240,222}, {90,62,40},    {150,120,90},  {110,175,100}, {200,150,100}, {220,100,90}, {220,195,160}, {215,190,165}, {255,255,255},
                {140,200,220}, {190,160,210}, {140,200,140}, {240,180,120}, {190,170,150}, {220,160,170}},
@@ -222,7 +224,10 @@ const Theme themes[] = {
                {250,160,120}, {220,130,170}, {240,190,100}, {250,140,90},  {200,150,160}, {180,120,200}},
   {"Mono",     {240,240,240}, {30,30,30},    {110,110,110}, {60,60,60},    {70,70,70},    {200,60,60},  {200,200,200}, {205,205,205}, {255,255,255},
                {110,110,110}, {130,130,130}, {90,90,90},    {150,150,150}, {120,120,120}, {100,100,100}},
+  {"OLED",     {0,0,0},       {245,245,247}, {142,142,147}, {10,132,255},  {22,22,24},    {255,69,58},  {44,44,48},    {0,0,0},       {24,24,27},
+               {10,132,255},  {191,90,242},  {48,209,88},   {255,159,10},  {99,99,102},   {255,55,95}},
 };
+const int THEME_OLED = 6;                    // position of "OLED" above; the default theme
 const int presetThemeCount = sizeof(themes) / sizeof(themes[0]);
 const int THEME_CUSTOM = presetThemeCount;   // index just past the presets
 const int themeCount = presetThemeCount + 1;
@@ -251,7 +256,7 @@ const RGB customAccents[8] = {
   {230,110,160}, {230,90,80},  {240,150,60}, {200,170,40},
 };
 
-int currentTheme = 0;
+int currentTheme = THEME_OLED;
 int customBase = 0;     // 0 = Light (Nook-based), 1 = Dark (Midnight-based)
 int customAccent = 0;   // index into customAccents
 
@@ -259,17 +264,24 @@ void loadThemeSettings() {
   if (!LittleFS.exists("/theme.txt")) return;
   File f = LittleFS.open("/theme.txt");
   if (!f) return;
-  char buf[16];
+  char buf[24];
   int i = 0;
-  while (f.available() && i < 15) buf[i++] = f.read();
+  while (f.available() && i < 23) buf[i++] = f.read();
   buf[i] = '\0';
   f.close();
-  int t = 0, b = 0, a = 0;
-  sscanf(buf, "%d,%d,%d", &t, &b, &a);
+  int t = 0, b = 0, a = 0, ver = 0;
+  int got = sscanf(buf, "%d,%d,%d,%d", &t, &b, &a, &ver);
   loadSecretUnlocked();
-  currentTheme = (t >= 0 && t < shownThemeCount()) ? t : 0;
   customBase = (b == 1) ? 1 : 0;
   customAccent = (a >= 0 && a < 8) ? a : 0;
+  if (got < 4 || ver < 2) {
+    // Saved before v3.4: the device moves to the new OLED look once. The old
+    // choice (and any Custom colors) is still in the Theme list.
+    currentTheme = THEME_OLED;
+    saveThemeSettings();
+    return;
+  }
+  currentTheme = (t >= 0 && t < shownThemeCount()) ? t : THEME_OLED;
 }
 
 // ---- Device name: chosen during first-time setup (or Settings > System >
@@ -315,7 +327,7 @@ void buildHostname(char* out, size_t len) {
 void saveThemeSettings() {
   LittleFS.remove("/theme.txt");
   File f = LittleFS.open("/theme.txt", FILE_WRITE);
-  if (f) { f.printf("%d,%d,%d", currentTheme, customBase, customAccent); f.close(); }
+  if (f) { f.printf("%d,%d,%d,2", currentTheme, customBase, customAccent); f.close(); }
 }
 
 // ---- The display. A thin layer over the ILI9341 driver that replaces the
@@ -438,7 +450,9 @@ void applyTheme(int idx) {
   COLOR_WEATHER   = rgb565(t.weather);
   COLOR_SETTINGS  = rgb565(t.settings);
   COLOR_MORE      = rgb565(t.more);
-  COLOR_BLUE      = (idx == THEME_SECRET) ? tft.color565(0, 150, 96) : tft.color565(90, 150, 220);
+  COLOR_BLUE      = (idx == THEME_SECRET) ? tft.color565(0, 150, 96)
+                  : (idx == THEME_OLED) ? tft.color565(48, 176, 199)      // teal, so it differs from To-Do's blue
+                  : tft.color565(90, 150, 220);
   COLOR_GRAY      = tft.color565(170, 170, 170);
 
   tileColors[0] = COLOR_MORE;      // widget tile background
@@ -642,6 +656,8 @@ int savedNetCount = 0;
 char weatherTemp[10] = "--";
 char weatherDesc[24] = "Not fetched yet";
 bool weatherFetching = false;
+int weatherCode = -1;                 // Open-Meteo weather code of the last fetch, -1 = none
+int weatherHigh = -999, weatherLow = -999;   // today's high / low in F, -999 = unknown
 
 // ---- Firmware update (OTA) state ----
 enum OtaState { OTA_IDLE, OTA_CHECKING, OTA_UP_TO_DATE, OTA_AVAILABLE, OTA_DOWNLOADING, OTA_FAILED, OTA_NO_WIFI };
@@ -3501,20 +3517,33 @@ void drawTodoScreen() {
         const char* displayText = line;
         if (strncmp(line, "[x] ", 4) == 0 || strncmp(line, "[ ] ", 4) == 0) displayText = line + 4;
 
-        tft.drawRoundRect(12, y + 2, 16, 16, 3, COLOR_SUBTEXT);
+        // round checkbox: an empty ring, or filled with a tick when done
         if (completed) {
-          tft.drawLine(15, y + 10, 19, y + 15, COLOR_ACCENT);
-          tft.drawLine(19, y + 15, 25, y + 5, COLOR_ACCENT);
+          tft.fillCircle(20, y + 10, 8, COLOR_ACCENT);
+          tft.drawLine(16, y + 10, 19, y + 13, ILI9341_WHITE);
+          tft.drawLine(19, y + 13, 24, y + 7, ILI9341_WHITE);
+          tft.drawLine(16, y + 11, 19, y + 14, ILI9341_WHITE);
+          tft.drawLine(19, y + 14, 24, y + 8, ILI9341_WHITE);
+        } else {
+          tft.drawCircle(20, y + 10, 8, COLOR_SUBTEXT);
+          tft.drawCircle(20, y + 10, 7, COLOR_SUBTEXT);
         }
 
+        tft.setFont();
         tft.setTextColor(completed ? COLOR_SUBTEXT : COLOR_TEXT);
         tft.setTextSize(1);
-        tft.setCursor(36, y + 8);
+        tft.setCursor(36, y + 5);
         tft.print(displayText);
+        if (completed) {                       // strike through finished tasks
+          int16_t bx, by; uint16_t bw, bh;
+          tft.getTextBounds(displayText, 0, 0, &bx, &by, &bw, &bh);
+          tft.drawFastHLine(36, y + 10, bw + 2, COLOR_SUBTEXT);
+        }
 
-        tft.setTextColor(COLOR_SUBTEXT);
-        tft.setCursor(212, y + 8);
-        tft.print("x");
+        // delete: a small drawn x
+        tft.drawLine(212, y + 6, 220, y + 14, COLOR_SUBTEXT);
+        tft.drawLine(220, y + 6, 212, y + 14, COLOR_SUBTEXT);
+        tft.drawFastHLine(12, y + 23, 216, COLOR_FRAME);   // row divider
 
         todoLineCount++;
         y += 26;
@@ -3526,7 +3555,7 @@ void drawTodoScreen() {
     tft.setTextColor(COLOR_SUBTEXT);
     tft.setTextSize(1);
     tft.setCursor(16, y + 8);
-    tft.print("No tasks yet");
+    tft.print("No tasks yet - tap Add Task");
   }
 
   drawGlassRect(20, 270, 200, 36, 18, COLOR_TODO);
@@ -3543,6 +3572,30 @@ int touchedHomeworkDelete(int x, int y) {
     }
   }
   return -1;
+}
+
+// Each class gets its own color (cycling through the eight accent colors),
+// shown as a stripe down the left of its section.
+uint16_t hwClassColor(int period) { return rgb565(customAccents[period % 8]); }
+
+void drawHomeworkHeader(int y, const char* name, uint16_t color) {
+  tft.fillRoundRect(10, y - 1, 4, 13, 2, color);
+  tft.setFont(&SynSmallBold);
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(20, y + 8);
+  tft.print(name);
+  tft.setFont();
+}
+
+void drawHomeworkItem(int y, const char* text, uint16_t color) {
+  tft.fillRect(11, y - 2, 2, 13, color);                 // stripe continues beside the items
+  tft.fillCircle(24, y + 4, 2, color);
+  tft.setFont();
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(32, y);
+  tft.print(text);
 }
 
 void drawHomeworkScreen() {
@@ -3573,27 +3626,19 @@ void drawHomeworkScreen() {
         char* textPart = sep + 1;
         if (strcmp(periodPart, schedule[p].name) == 0) {
           if (!headerDrawn) {
-            tft.setTextColor(COLOR_ACCENT);
-            tft.setTextSize(1);
-            tft.setCursor(12, y);
-            tft.print(schedule[p].name);
+            drawHomeworkHeader(y, schedule[p].name, hwClassColor(p));
             y += 14;
             headerDrawn = true;
             linesDrawn++;
           }
-          tft.setTextColor(COLOR_TEXT);
-          tft.setTextSize(1);
-          tft.setCursor(20, y);
-          tft.print("- ");
-          tft.print(textPart);
+          drawHomeworkItem(y, textPart, hwClassColor(p));
 
           if (hwLineCount < 8) {
             strncpy(hwLines[hwLineCount], rawLine, sizeof(hwLines[0]) - 1);
             hwLines[hwLineCount][sizeof(hwLines[0]) - 1] = '\0';
             hwLineY[hwLineCount] = y;
-            tft.setTextColor(COLOR_SUBTEXT);
-            tft.setCursor(212, y);
-            tft.print("x");
+            tft.drawLine(213, y + 1, 219, y + 7, COLOR_SUBTEXT);
+            tft.drawLine(219, y + 1, 213, y + 7, COLOR_SUBTEXT);
             hwLineCount++;
           }
 
@@ -3623,27 +3668,19 @@ void drawHomeworkScreen() {
         char* textPart = sep + 1;
         if (strcmp(periodPart, "Unscheduled") == 0) {
           if (!headerDrawn) {
-            tft.setTextColor(COLOR_ACCENT);
-            tft.setTextSize(1);
-            tft.setCursor(12, y);
-            tft.print("Unscheduled");
+            drawHomeworkHeader(y, "Unscheduled", COLOR_SUBTEXT);
             y += 14;
             headerDrawn = true;
             linesDrawn++;
           }
-          tft.setTextColor(COLOR_TEXT);
-          tft.setTextSize(1);
-          tft.setCursor(20, y);
-          tft.print("- ");
-          tft.print(textPart);
+          drawHomeworkItem(y, textPart, COLOR_SUBTEXT);
 
           if (hwLineCount < 8) {
             strncpy(hwLines[hwLineCount], rawLine, sizeof(hwLines[0]) - 1);
             hwLines[hwLineCount][sizeof(hwLines[0]) - 1] = '\0';
             hwLineY[hwLineCount] = y;
-            tft.setTextColor(COLOR_SUBTEXT);
-            tft.setCursor(212, y);
-            tft.print("x");
+            tft.drawLine(213, y + 1, 219, y + 7, COLOR_SUBTEXT);
+            tft.drawLine(219, y + 1, 213, y + 7, COLOR_SUBTEXT);
             hwLineCount++;
           }
 
@@ -3660,7 +3697,7 @@ void drawHomeworkScreen() {
     tft.setTextColor(COLOR_SUBTEXT);
     tft.setTextSize(1);
     tft.setCursor(16, y + 8);
-    tft.print("Nothing logged yet");
+    tft.print("Nothing logged yet - tap Add Homework");
   }
 
   drawGlassRect(20, 270, 200, 36, 18, COLOR_HOMEWORK);
@@ -4040,30 +4077,82 @@ const char* weatherCodeToDesc(int code) {
   return "Unknown";
 }
 
-bool touchedWeatherRefresh(int x, int y) { return x >= 70 && x <= 170 && y >= 260 && y <= 300; }
+bool touchedWeatherRefresh(int x, int y) { return x >= 70 && x <= 170 && y >= 262 && y <= 302; }
+
+// ---- big condition icon, built from circles and lines ----
+void wxSun(int cx, int cy, int r) {
+  uint16_t c = tft.color565(255, 190, 40);
+  tft.fillCircle(cx, cy, r, c);
+  for (int i = 0; i < 8; i++) {
+    float a = i * PI / 4;
+    for (int t = -1; t <= 1; t++)
+      tft.drawLine(cx + cos(a) * (r + 5) + t, cy + sin(a) * (r + 5), cx + cos(a) * (r + 13) + t, cy + sin(a) * (r + 13), c);
+  }
+}
+
+void wxCloud(int cx, int cy, uint16_t c) {
+  tft.fillCircle(cx - 16, cy + 4, 12, c);
+  tft.fillCircle(cx, cy - 6, 17, c);
+  tft.fillCircle(cx + 18, cy + 2, 13, c);
+  tft.fillRoundRect(cx - 28, cy + 2, 60, 15, 7, c);
+}
+
+void drawWeatherIcon(int cx, int cy, int code) {
+  uint16_t cloud = blendColor(COLOR_SUBTEXT, COLOR_SURFACE, 45);
+  uint16_t dark = COLOR_SUBTEXT;
+  uint16_t rain = tft.color565(70, 150, 240);
+  if (code == 0) { wxSun(cx, cy, 16); return; }
+  if (code == 1 || code == 2) { wxSun(cx + 14, cy - 12, 11); wxCloud(cx - 4, cy + 6, cloud); return; }
+  if (code == 3) { wxCloud(cx, cy, cloud); return; }
+  if (code == 45 || code == 48) {                                  // fog: soft bars
+    for (int i = 0; i < 4; i++) tft.fillRoundRect(cx - 28 + (i % 2) * 8, cy - 18 + i * 11, 50, 5, 2, cloud);
+    return;
+  }
+  bool thunder = (code >= 95);
+  bool snow = (code >= 71 && code <= 77) || code == 85 || code == 86;
+  wxCloud(cx, cy - 8, thunder ? dark : cloud);
+  if (thunder) {
+    uint16_t bolt = tft.color565(255, 200, 40);
+    tft.fillTriangle(cx + 2, cy + 8, cx - 8, cy + 24, cx + 1, cy + 22, bolt);
+    tft.fillTriangle(cx - 1, cy + 20, cx + 8, cy + 18, cx - 4, cy + 36, bolt);
+  } else if (snow) {
+    for (int i = 0; i < 4; i++) tft.fillCircle(cx - 21 + i * 14, cy + 20 + (i % 2) * 8, 2, COLOR_TEXT);
+  } else {                                                         // drizzle, rain, showers
+    for (int i = 0; i < 4; i++)
+      for (int t = 0; t < 2; t++)
+        tft.drawLine(cx - 18 + i * 13 + t, cy + 14, cx - 23 + i * 13 + t, cy + 28, rain);
+  }
+}
 
 void drawWeatherScreen() {
   tft.fillScreen(COLOR_BG);
   drawScreenFrame();
   drawBackBar("Weather");
 
-  printCentered(&FreeSans12pt7b, 120, 80, WEATHER_LOCATION_LABEL, COLOR_SUBTEXT);
+  printCentered(&FreeSans9pt7b, 120, 36, WEATHER_LOCATION_LABEL, COLOR_SUBTEXT);
 
   if (weatherFetching) {
-    printCentered(&FreeSans12pt7b, 120, 150, "Fetching...", COLOR_SUBTEXT);
+    printCentered(&FreeSans12pt7b, 120, 140, "Fetching...", COLOR_SUBTEXT);
   } else {
-    drawTempWithDegree(weatherTemp, 120, 120, COLOR_TEXT);
-    printCentered(&FreeSans12pt7b, 120, 185, weatherDesc, COLOR_SUBTEXT);
+    if (weatherCode >= 0) drawWeatherIcon(120, 96, weatherCode);
+    drawTempWithDegree(weatherTemp, 120, weatherCode >= 0 ? 146 : 110, COLOR_TEXT);
+    printCentered(&FreeSans12pt7b, 120, weatherCode >= 0 ? 194 : 170, weatherDesc, COLOR_SUBTEXT);
+    if (weatherHigh > -999 && weatherLow > -999) {
+      char hl[32];
+      snprintf(hl, sizeof(hl), "High %d   Low %d", weatherHigh, weatherLow);
+      printCentered(&FreeSansBold9pt7b, 120, 226, hl, COLOR_TEXT);
+    }
   }
 
-  drawGlassRect(70, 260, 100, 40, 18, COLOR_WEATHER);
-  printFitted(&FreeSansBold12pt7b, 120, 272, "Refresh", ILI9341_WHITE, 90);
+  drawGlassRect(70, 262, 100, 40, 18, COLOR_WEATHER);
+  printFitted(&FreeSansBold12pt7b, 120, 274, "Refresh", ILI9341_WHITE, 90);
 }
 
 void fetchWeather() {
   if (WiFi.status() != WL_CONNECTED) {
     strcpy(weatherDesc, "Connect WiFi first");
     strcpy(weatherTemp, "--");
+    weatherCode = -1; weatherHigh = weatherLow = -999;
     drawWeatherScreen();
     return;
   }
@@ -4074,27 +4163,37 @@ void fetchWeather() {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" WEATHER_LAT "&longitude=" WEATHER_LON "&current_weather=true&temperature_unit=fahrenheit";
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" WEATHER_LAT "&longitude=" WEATHER_LON "&current_weather=true&temperature_unit=fahrenheit"
+               "&daily=temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=auto";
   http.begin(client, url);
   int code = http.GET();
 
   if (code == 200) {
     String payload = http.getString();
-    StaticJsonDocument<512> doc;
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (!err) {
       float t = doc["current_weather"]["temperature"];
       int wcode = doc["current_weather"]["weathercode"];
       sprintf(weatherTemp, "%.0f", t);
+      weatherCode = wcode;
+      // today's high / low (left unknown if the reply doesn't include them)
+      weatherHigh = weatherLow = -999;
+      if (!doc["daily"]["temperature_2m_max"][0].isNull() && !doc["daily"]["temperature_2m_min"][0].isNull()) {
+        weatherHigh = (int)lroundf(doc["daily"]["temperature_2m_max"][0].as<float>());
+        weatherLow = (int)lroundf(doc["daily"]["temperature_2m_min"][0].as<float>());
+      }
       strncpy(weatherDesc, weatherCodeToDesc(wcode), sizeof(weatherDesc) - 1);
       weatherDesc[sizeof(weatherDesc) - 1] = '\0';
     } else {
       strcpy(weatherDesc, "Parse error");
       strcpy(weatherTemp, "--");
+      weatherCode = -1; weatherHigh = weatherLow = -999;
     }
   } else {
     strcpy(weatherDesc, "Fetch failed");
     strcpy(weatherTemp, "--");
+    weatherCode = -1; weatherHigh = weatherLow = -999;
   }
   http.end();
 
@@ -4763,8 +4862,8 @@ void drawThemeSwatches(int x, int y, RGB bg, RGB accent, RGB bar, RGB tile) {
   tft.drawRect(x - 1, y - 1, 50, 22, COLOR_SUBTEXT);
 }
 
-// Rows get a little shorter once the secret theme adds an eighth one.
-int themeRowPitch() { return secretUnlocked ? 36 : 40; }
+// Rows get a little shorter once the secret theme adds a ninth one.
+int themeRowPitch() { return shownThemeCount() > 8 ? 32 : 36; }
 
 void drawThemesScreen() {
   tft.fillScreen(COLOR_BG);

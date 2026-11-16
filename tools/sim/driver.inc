@@ -35,7 +35,7 @@ void tap(int x, int y) {
 int main(int argc, char** argv) {
   if (argc > 1) simOutDir = argv[1];
   simFiles["/todo.txt"] = "[ ] Finish math worksheet\n[x] Charge PDA\n[ ] Email Mr. Hall\n";
-  simFiles["/homework.txt"] = "Math|Page 42 #1-20\nEnglish|Read chapter 5\n";
+  simFiles["/homework.txt"] = "1st Hour|Page 42 #1-20\n3rd Hour|Read chapter 5\n1st Hour|Study for quiz\nUnscheduled|Sign field trip form\n4th Hour|Lab report draft\n";
   simFiles["/name.txt"] = "Fox";
   simFiles["/msgon.txt"] = "1";
   simFiles["/contacts.txt"] = "Hound Dog|192.168.1.77\nMaya|192.168.1.80\n";

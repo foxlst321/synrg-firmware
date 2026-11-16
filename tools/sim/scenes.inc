@@ -17,6 +17,13 @@ void runScenes() {
   currentScreen = SCREEN_TODO; drawTodoScreen(); shot("todo");
   currentScreen = SCREEN_HOMEWORK; drawHomeworkScreen(); shot("homework");
   currentScreen = SCREEN_WEATHER; drawWeatherScreen(); shot("weather");
+  { int codes[] = {0, 2, 3, 45, 63, 73, 95};
+    for (int i = 0; i < 7; i++) {
+      weatherCode = codes[i]; strcpy(weatherTemp, "54"); strcpy(weatherDesc, weatherCodeToDesc(codes[i]));
+      weatherHigh = 61; weatherLow = 43; drawWeatherScreen();
+      char nm[24]; snprintf(nm, sizeof(nm), "weather_%d", codes[i]); shot(nm);
+    }
+    weatherCode = -1; weatherHigh = weatherLow = -999; strcpy(weatherTemp, "--"); strcpy(weatherDesc, "Not fetched yet"); }
   settingsCategory = -1; currentScreen = SCREEN_SETTINGS; drawSettingsScreen(); shot("settings");
   settingsCategory = 0; drawSettingsScreen(); shot("settings_appearance");
   currentScreen = SCREEN_THEMES; drawThemesScreen(); shot("themes");
