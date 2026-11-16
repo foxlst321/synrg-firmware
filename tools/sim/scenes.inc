@@ -1,6 +1,18 @@
 // Which screens to capture. Each shot() writes shots/<name>.ppm.
 void runScenes() {
+  drawBootScreen(); shot("boot");
   currentScreen = SCREEN_LOCK; drawLockScreen(clockNow()); shot("lock");
+  contacts[0].unread = 1; strcpy(msgBanner, "New message from Hound Dog");
+  strcpy(weatherTemp, "54"); strcpy(weatherDesc, "Partly cloudy");
+  drawLockScreen(clockNow()); shot("lock_notifs");
+  contacts[1].unread = 3; drawLockScreen(DateTime(2026, 11, 16, 18, 5, 0)); shot("lock_evening");
+  currentScreen = SCREEN_HOME; drawHomeScreen(clockNow()); shot("home_unread");
+  contacts[0].unread = 0; contacts[1].unread = 0; msgBanner[0] = 0;
+  for (int w = 0; w < WIDGET_COUNT; w++) {
+    homeWidget = w; drawHomeScreen(clockNow());
+    char nm[24]; snprintf(nm, sizeof(nm), "home_widget%d", w); shot(nm);
+  }
+  homeWidget = WIDGET_CLOCK;
   currentScreen = SCREEN_HOME; drawHomeScreen(clockNow()); shot("home");
   currentScreen = SCREEN_TODO; drawTodoScreen(); shot("todo");
   currentScreen = SCREEN_HOMEWORK; drawHomeworkScreen(); shot("homework");
@@ -42,18 +54,18 @@ void runScenes() {
   // tap-through smoke test: lock -> home -> settings -> appearance -> toggle -> back
   currentScreen = SCREEN_LOCK; drawLockScreen(clockNow());
   tap(120, 200);                 // unlock
-  tap(175, 250);                 // Settings tile
+  tap(175, 265);                 // Settings tile
   tap(120, 60);                  // Appearance
   tap(120, 118);                 // Animations toggle (partial redraw + ring release)
   shot("tap_appearance");
   tap(20, 10); tap(20, 10);      // back, back
-  tap(150, 12);                  // envelope -> Messages
+  tap(66, 265);                  // Messages tile
   tap(120, 85);                  // first contact
   tap(80, 290);                  // Write
   tap(60, 140); tap(84, 140);    // type two letters
   shot("tap_typing");
   tap(20, 10); tap(20, 10); tap(20, 10);
-  tap(175, 80);                  // To-Do tile
+  tap(66, 130);                  // To-Do tile
   tap(120, 295);                 // Add Task
   tap(60, 95); tap(84, 95); tap(200, 228);   // type 2, delete 1
   shot("tap_keyboard");
