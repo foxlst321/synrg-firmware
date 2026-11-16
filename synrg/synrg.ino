@@ -61,7 +61,7 @@
 #define BUBBLE_MAX_LINES 5
 // A pressable button on screen (see drawGlassRect / flashPressedButton).
 struct ButtonRect { int16_t x, y, w, h, r; uint16_t color; };
-struct Contact { char name[DEVICE_NAME_MAX + 1]; char ip[16]; int unread; };
+struct Contact { char name[DEVICE_NAME_MAX + 1]; char ip[16]; int unread; bool rtx; };   // rtx: they are in Jensen mode
 struct MsgLine { char dir; char ip[16]; char when[9]; char text[MSG_TEXT_MAX + 1]; };
 
 enum KeyboardContext { KB_CONTEXT_NONE, KB_CONTEXT_ADD_TODO, KB_CONTEXT_ADD_HOMEWORK, KB_CONTEXT_WIFI_PASSWORD, KB_CONTEXT_DEVICE_NAME, KB_CONTEXT_MSG_IP };
@@ -78,7 +78,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v3.7"
+#define FIRMWARE_VERSION "v3.8"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -656,6 +656,7 @@ int savedNetCount = 0;
 char weatherTemp[10] = "--";
 char weatherDesc[24] = "Not fetched yet";
 bool weatherFetching = false;
+char weatherStatus[32] = "";          // note under the reading when a manual Refresh fails
 unsigned long weatherNextTryMs = 0;   // when the weather may be auto-synced again (0 = as soon as possible)
 int weatherCode = -1;                 // Open-Meteo weather code of the last fetch, -1 = none
 int weatherHigh = -999, weatherLow = -999;   // today's high / low in F, -999 = unknown
@@ -1207,6 +1208,7 @@ char newChatIp[16] = "";
 bool reqPending = false;
 char reqName[DEVICE_NAME_MAX + 1] = "";
 char reqIp[16] = "";
+bool reqRtx = false;               // the PDA asking to connect is in Jensen mode
 Screen reqReturnScreen = SCREEN_HOME;
 
 // one-line notice shown on Home ("Hound Dog accepted", "New message from ...")
@@ -1264,7 +1266,7 @@ void saveContacts() {
   LittleFS.remove("/contacts.txt");
   File f = LittleFS.open("/contacts.txt", FILE_WRITE);
   if (!f) return;
-  for (int i = 0; i < contactCount; i++) f.printf("%s|%s\n", contacts[i].name, contacts[i].ip);
+  for (int i = 0; i < contactCount; i++) f.printf("%s|%s|%d\n", contacts[i].name, contacts[i].ip, contacts[i].rtx ? 1 : 0);
   f.close();
 }
 
@@ -1280,6 +1282,7 @@ int addOrUpdateContact(const char* name, const char* ip) {
     if (contactCount >= MAX_CONTACTS) return -1;
     i = contactCount++;
     contacts[i].unread = 0;
+    contacts[i].rtx = false;
   }
   cleanMsgField(contacts[i].name, sizeof(contacts[i].name), name[0] ? name : "SynRG");
   cleanMsgField(contacts[i].ip, sizeof(contacts[i].ip), ip);
@@ -1332,11 +1335,13 @@ void loadMessaging() {
   if (LittleFS.exists("/contacts.txt")) {
     File f = LittleFS.open("/contacts.txt");
     while (f && readLineFromFile(f, line, sizeof(line)) && contactCount < MAX_CONTACTS) {
-      if (splitBars(line, parts, 2) < 2) continue;
+      int got = splitBars(line, parts, 3);
+      if (got < 2) continue;
       Contact& c = contacts[contactCount++];
       cleanMsgField(c.name, sizeof(c.name), parts[0]);
       cleanMsgField(c.ip, sizeof(c.ip), parts[1]);
       c.unread = 0;
+      c.rtx = (got >= 3 && parts[2][0] == '1');
     }
     if (f) f.close();
   }
@@ -1365,6 +1370,18 @@ String urlEncode(const char* in) {
     else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
   }
   return out;
+}
+
+// Added to everything sent to another SynRG: "&rtx=1" while this PDA is in
+// Jensen mode, so its picture on their side becomes the green RTX badge.
+String rtxTag() { return String(currentTheme == THEME_SECRET ? "&rtx=1" : "&rtx=0"); }
+
+// A peer just told us (or not) whether it is in Jensen mode. PDAs on older
+// firmware don't say, and their picture is left as it was.
+void noteContactRtx(int idx) {
+  if (idx < 0 || !server.hasArg("rtx")) return;
+  bool rtx = (server.arg("rtx") == "1");
+  if (contacts[idx].rtx != rtx) { contacts[idx].rtx = rtx; saveContacts(); }
 }
 
 // Calls another SynRG; returns the HTTP code (200 = ok, 403 = they have
@@ -1397,7 +1414,7 @@ void sendConnectRequest(const char* ip) {
   if (existing >= 0) { openChat(existing); return; }
   strcpy(msgStatus, "Asking to connect...");
   drawMessagesScreen();
-  int code = callPeer(ip, "/msg/request?from=" + urlEncode(deviceName));
+  int code = callPeer(ip, "/msg/request?from=" + urlEncode(deviceName) + rtxTag());
   if (code == 200) {
     strncpy(msgOutgoingIp, ip, sizeof(msgOutgoingIp) - 1);
     msgOutgoingIp[sizeof(msgOutgoingIp) - 1] = '\0';
@@ -1410,7 +1427,7 @@ void sendConnectRequest(const char* ip) {
 void sendChatMessage(const char* text) {
   if (chatContact < 0) return;
   Contact& c = contacts[chatContact];
-  int code = callPeer(c.ip, "/msg/send?from=" + urlEncode(deviceName) + "&text=" + urlEncode(text));
+  int code = callPeer(c.ip, "/msg/send?from=" + urlEncode(deviceName) + rtxTag() + "&text=" + urlEncode(text));
   // delivered -> 'o' (gets a tick); otherwise kept as 'f' so it can be retried
   addMessage(code == 200 ? 'o' : 'f', c.ip, text);
 }
@@ -1435,13 +1452,15 @@ void handleMsgRequest() {
   String ip = server.client().remoteIP().toString();
   int existing = findContactByIp(ip.c_str());
   if (existing >= 0) {                        // already friends: just say yes again
+    noteContactRtx(existing);
     server.send(200, "text/plain", "ok");
-    callPeer(ip.c_str(), "/msg/accept?from=" + urlEncode(deviceName));
+    callPeer(ip.c_str(), "/msg/accept?from=" + urlEncode(deviceName) + rtxTag());
     return;
   }
   server.send(200, "text/plain", "pending");
   cleanMsgField(reqName, sizeof(reqName), from.length() ? from.c_str() : "SynRG");
   cleanMsgField(reqIp, sizeof(reqIp), ip.c_str());
+  reqRtx = server.hasArg("rtx") && server.arg("rtx") == "1";
   reqPending = true;
   if (canShowPopupNow()) showConnectPopup();
 }
@@ -1455,6 +1474,7 @@ void handleMsgAccept() {
   String from = server.hasArg("from") ? server.arg("from") : String("SynRG");
   server.send(200, "text/plain", "ok");
   int idx = addOrUpdateContact(from.c_str(), ip.c_str());
+  noteContactRtx(idx);
   msgOutgoingIp[0] = '\0';
   if (idx >= 0) {
     snprintf(msgBanner, sizeof(msgBanner), "%s accepted!", contacts[idx].name);
@@ -1472,6 +1492,7 @@ void handleMsgSend() {
   if (!server.hasArg("text") || server.arg("text").length() == 0) { server.send(400, "text/plain", "missing text"); return; }
   if (server.hasArg("from") && server.arg("from").length())     // they may have renamed their PDA
     addOrUpdateContact(server.arg("from").c_str(), ip.c_str());
+  noteContactRtx(idx);
   addMessage('i', ip.c_str(), server.arg("text").c_str());
   server.send(200, "text/plain", "ok");
   bool reading = (currentScreen == SCREEN_CHAT && chatContact == idx);
@@ -1524,7 +1545,8 @@ void handleConnectPopupTouch(int x, int y) {
   if (x >= 122 && x <= 210) {                     // Accept
     reqPending = false;
     int idx = addOrUpdateContact(reqName, reqIp);
-    callPeer(reqIp, "/msg/accept?from=" + urlEncode(deviceName));
+    if (idx >= 0 && contacts[idx].rtx != reqRtx) { contacts[idx].rtx = reqRtx; saveContacts(); }
+    callPeer(reqIp, "/msg/accept?from=" + urlEncode(deviceName) + rtxTag());
     if (idx >= 0) openChat(idx);
     else { strcpy(msgStatus, "Contacts full (8)"); openMessages(); }
   }
@@ -1547,6 +1569,22 @@ void drawAvatar(int cx, int cy, int r, const char* name) {
   else { tft.setTextSize(1); tft.setCursor(cx - 2, cy - 3); }
   tft.print(letter);
   tft.setTextSize(1);
+}
+
+// A contact's picture: their colored initial, or -- if their PDA is in
+// Jensen mode -- a green badge that says RTX.
+void drawContactAvatar(int cx, int cy, int r, const Contact& c) {
+  if (!c.rtx) { drawAvatar(cx, cy, r, c.name); return; }
+  tft.fillCircle(cx, cy, r, tft.color565(118, 185, 0));
+  tft.drawCircle(cx, cy, r, ILI9341_BLACK);
+  tft.setFont(&SynSmallBold);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_BLACK);
+  int16_t x1, y1; uint16_t tw, th;
+  tft.getTextBounds("RTX", 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor(cx - (int)tw / 2 - x1, cy + 4);
+  tft.print("RTX");
+  tft.setFont();
 }
 
 // index in msgList of the newest message with this IP, or -1
@@ -1602,7 +1640,9 @@ void showBanner(const char* name, const char* ip, const char* line) {
   tft.fillRoundRect(4, 2, 232, 38, 12, COLOR_SURFACE);
   tft.drawRoundRect(4, 2, 232, 38, 12, COLOR_ACCENT);
   tft.drawRoundRect(5, 3, 230, 36, 11, COLOR_ACCENT);
-  drawAvatar(24, 21, 13, name);
+  int bannerContact = findContactByIp(ip);
+  if (bannerContact >= 0) drawContactAvatar(24, 21, 13, contacts[bannerContact]);
+  else drawAvatar(24, 21, 13, name);
   tft.setFont();
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT);
@@ -1673,6 +1713,7 @@ void pollDiscovery(bool collect) {
     cleanMsgField(nearby[nearbyCount].name, sizeof(nearby[nearbyCount].name), buf[6] ? buf + 6 : "SynRG");
     cleanMsgField(nearby[nearbyCount].ip, sizeof(nearby[nearbyCount].ip), ipStr.c_str());
     nearby[nearbyCount].unread = 0;
+    nearby[nearbyCount].rtx = false;
     nearbyCount++;
   }
 }
@@ -1779,7 +1820,7 @@ void drawMessagesScreen() {
     Contact& c = contacts[row + contactScroll];
     int y = CONTACT_Y + row * CONTACT_H;
     drawGlassRect(8, y, 224, 34, 12, COLOR_SURFACE);
-    drawAvatar(26, y + 17, 13, c.name);
+    drawContactAvatar(26, y + 17, 13, c);
 
     int last = lastMessageFor(c.ip);
     tft.setTextColor(COLOR_TEXT);
@@ -1962,7 +2003,18 @@ void drawChatMessages(int top, int bottom) {
       showTime = ((next.dir != 'i') != out) || strcmp(next.when, m.when) != 0 || next.dir == 'f';
     }
     int need = h + (showTime ? 11 : 0) + 4;
-    if (y - need < top) { chatCanScrollUp = true; break; }
+    if (y - need < top) {
+      chatCanScrollUp = true;
+      int room = (y - top - 4 - 8 - (showTime ? 11 : 0)) / 11;       // lines that would still fit
+      if (y != bottom || room < 1) break;
+      // nothing drawn yet: show the end of this message rather than a blank area
+      int drop = n - room;
+      for (int l = 0; l < room; l++) strcpy(lines[l], lines[l + drop]);
+      n = room;
+      if (strlen(lines[0]) > 3) memcpy(lines[0], "...", 3);
+      h = n * 11 + 8;
+      need = h + (showTime ? 11 : 0) + 4;
+    }
     y -= need;
 
     int x = out ? 232 - w : 8;
@@ -2062,7 +2114,7 @@ void drawChatScreen() {
   tft.setCursor(8, 10);
   tft.print("<");
   tft.setTextSize(1);
-  drawAvatar(42, 18, 13, c.name);
+  drawContactAvatar(42, 18, 13, c);
   tft.setTextColor(ILI9341_WHITE);
   tft.setCursor(62, 7);
   tft.print(c.name);
@@ -2105,7 +2157,7 @@ void drawChatScreen() {
 void retryMessage(int msgIndex) {
   MsgLine& m = msgList[msgIndex];
   if (m.dir != 'f') return;
-  int code = callPeer(m.ip, "/msg/send?from=" + urlEncode(deviceName) + "&text=" + urlEncode(m.text));
+  int code = callPeer(m.ip, "/msg/send?from=" + urlEncode(deviceName) + rtxTag() + "&text=" + urlEncode(m.text));
   if (code == 200) {
     m.dir = 'o';
     DateTime now = clockNow();
@@ -3779,7 +3831,7 @@ void drawLockScreen(DateTime now) {
   for (int i = 0; i < contactCount && cards < 2; i++) {
     if (contacts[i].unread == 0) continue;
     drawLockCard(cardY, 36);
-    drawAvatar(34, cardY + 18, 12, contacts[i].name);
+    drawContactAvatar(34, cardY + 18, 12, contacts[i]);
     tft.setFont(&SynSmallBold);
     tft.setTextColor(COLOR_TEXT);
     tft.setCursor(54, cardY + 15);
@@ -4815,7 +4867,7 @@ const char* weatherCodeToDesc(int code) {
   return "Unknown";
 }
 
-bool touchedWeatherRefresh(int x, int y) { return x >= 70 && x <= 170 && y >= 262 && y <= 302; }
+bool touchedWeatherRefresh(int x, int y) { return x >= 70 && x <= 170 && y >= 264 && y <= 304; }
 
 // ---- big condition icon, built from circles and lines ----
 void wxSun(int cx, int cy, int r) {
@@ -4876,14 +4928,46 @@ void drawWeatherScreen() {
     drawTempWithDegree(weatherTemp, 120, weatherCode >= 0 ? 146 : 110, COLOR_TEXT);
     printCentered(&FreeSans12pt7b, 120, weatherCode >= 0 ? 194 : 170, weatherDesc, COLOR_SUBTEXT);
     if (weatherHigh > -999 && weatherLow > -999) {
-      char hl[32];
-      snprintf(hl, sizeof(hl), "High %d   Low %d", weatherHigh, weatherLow);
-      printCentered(&FreeSansBold9pt7b, 120, 226, hl, COLOR_TEXT);
+      // "High 61 / Low 43" with a big bold slash in the accent color
+      char hi[16], lo[16];
+      snprintf(hi, sizeof(hi), "High %d", weatherHigh);
+      snprintf(lo, sizeof(lo), "Low %d", weatherLow);
+      int16_t bx, by; uint16_t wHi, wLo, wSlash, bh;
+      tft.setFont(&FreeSansBold9pt7b);
+      tft.setTextSize(1);
+      tft.getTextBounds(hi, 0, 0, &bx, &by, &wHi, &bh);
+      tft.getTextBounds(lo, 0, 0, &bx, &by, &wLo, &bh);
+      tft.setFont(&FreeSansBold18pt7b);
+      tft.getTextBounds("/", 0, 0, &bx, &by, &wSlash, &bh);
+      int gap = 10, total = wHi + gap + wSlash + gap + wLo;
+      int x = 120 - total / 2;
+      tft.setFont(&FreeSansBold9pt7b);
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(x, 240);
+      tft.print(hi);
+      tft.setFont(&FreeSansBold18pt7b);
+      tft.setTextColor(COLOR_ACCENT);
+      tft.setCursor(x + wHi + gap - bx, 247);
+      tft.print("/");
+      tft.setFont(&FreeSansBold9pt7b);
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(x + wHi + gap + wSlash + gap, 240);
+      tft.print(lo);
+      tft.setFont();
     }
   }
 
-  drawGlassRect(70, 262, 100, 40, 18, COLOR_WEATHER);
-  printFitted(&FreeSansBold12pt7b, 120, 274, "Refresh", ILI9341_WHITE, 90);
+  if (weatherStatus[0] && !weatherFetching) {       // why the last Refresh didn't work
+    tft.setFont();
+    tft.setTextColor(COLOR_ERROR);
+    int16_t sx, sy; uint16_t sw, sh;
+    tft.getTextBounds(weatherStatus, 0, 0, &sx, &sy, &sw, &sh);
+    tft.setCursor(120 - sw / 2, 250);
+    tft.print(weatherStatus);
+  }
+
+  drawGlassRect(70, 264, 100, 40, 18, COLOR_WEATHER);
+  printFitted(&FreeSansBold12pt7b, 120, 276, "Refresh", ILI9341_WHITE, 90);
 }
 
 // Downloads the current weather. On success the values are replaced and it
@@ -4925,21 +5009,21 @@ bool fetchWeatherData() {
   return ok;
 }
 
-// The Refresh button on the Weather screen.
+// The Refresh button on the Weather screen. If it can't update, the last
+// reading stays on screen with a short note saying why.
 void fetchWeather() {
+  weatherStatus[0] = '\0';
   if (WiFi.status() != WL_CONNECTED) {
-    strcpy(weatherDesc, "Connect WiFi first");
-    strcpy(weatherTemp, "--");
-    weatherCode = -1; weatherHigh = weatherLow = -999;
+    strcpy(weatherStatus, "No WiFi - couldn't update");
+    if (weatherCode < 0) strcpy(weatherDesc, "Connect WiFi first");
     drawWeatherScreen();
     return;
   }
   weatherFetching = true;
   drawWeatherScreen();
   if (!fetchWeatherData()) {
-    strcpy(weatherDesc, "Fetch failed");
-    strcpy(weatherTemp, "--");
-    weatherCode = -1; weatherHigh = weatherLow = -999;
+    strcpy(weatherStatus, "Couldn't update - try again");
+    if (weatherCode < 0) strcpy(weatherDesc, "Fetch failed");
   }
   weatherFetching = false;
   drawWeatherScreen();
@@ -4968,27 +5052,32 @@ void weatherAutoRefresh(bool touching) {
 // ============================================================
 // UI: SNAKE GAME
 // ============================================================
-// Layout: a back bar + score line up top, then a big play field that
-// takes up the rest of the screen. Controlled entirely by swiping on
-// the field -- swipe up/down/left/right to steer, no on-screen buttons.
-#define SNAKE_CELL 8
-const int snakeGridCols = 26;
-const int snakeGridRows = 31;
-const int snakeFieldW = snakeGridCols * SNAKE_CELL;  // 208
-const int snakeFieldH = snakeGridRows * SNAKE_CELL;  // 248
-const int snakeFieldX = (240 - snakeFieldW) / 2;      // 16
+// Layout: a back bar + score line up top, then the board. Controlled
+// entirely by swiping on the board -- swipe up/down/left/right to steer.
+// A 18 x 20 board of 12-pixel squares on a checkerboard, so it's easy to
+// see exactly which square the snake and the food are on. Only the squares
+// that change are redrawn each step (new head, old head, tail), so the
+// board never flickers.
+#define SNAKE_CELL 12
+const int snakeGridCols = 18;
+const int snakeGridRows = 20;
+const int snakeFieldW = snakeGridCols * SNAKE_CELL;  // 216
+const int snakeFieldH = snakeGridRows * SNAKE_CELL;  // 240
+const int snakeFieldX = (240 - snakeFieldW) / 2;      // 12
 const int snakeFieldY = 46;
 
-#define SNAKE_MAX_LEN 300
+#define SNAKE_MAX_LEN 360
 int snakeX[SNAKE_MAX_LEN], snakeY[SNAKE_MAX_LEN];
 int snakeLen = 3;
 SnakeDir snakeDir = SNAKE_RIGHT;
-SnakeDir snakeNextDir = SNAKE_RIGHT;
+SnakeDir snakeQueue[2];              // up to two turns waiting, so quick double swipes both count
+int snakeQueueLen = 0;
 int snakeFoodX = 0, snakeFoodY = 0;
 bool snakeGameOver = false;
+bool snakeWaiting = true;            // true until the first swipe starts the game
 unsigned long snakeLastTickMs = 0;
-const unsigned long SNAKE_TICK_MS = 140;
 int snakeScore = 0;
+int snakeBest = -1;                  // best score, kept in /snake.txt (-1 = not loaded yet)
 
 // ---- Swipe tracking: a swipe is measured from where the finger first
 // touched down on the field to how far it has dragged since. Once it
@@ -4997,7 +5086,32 @@ int snakeScore = 0;
 int snakeSwipeStartX = -1;
 int snakeSwipeStartY = -1;
 bool snakeSwipeFired = false;
-const int SNAKE_SWIPE_THRESHOLD = 18;
+const int SNAKE_SWIPE_THRESHOLD = 14;
+
+void loadSnakeBest() {
+  snakeBest = 0;
+  if (!LittleFS.exists("/snake.txt")) return;
+  File f = LittleFS.open("/snake.txt");
+  if (!f) return;
+  char buf[8];
+  int i = 0;
+  while (f.available() && i < 7) buf[i++] = f.read();
+  buf[i] = '\0';
+  f.close();
+  snakeBest = atoi(buf);
+}
+
+void saveSnakeBest() {
+  LittleFS.remove("/snake.txt");
+  File f = LittleFS.open("/snake.txt", FILE_WRITE);
+  if (f) { f.print(snakeBest); f.close(); }
+}
+
+// The snake speeds up a little with every bite, down to a floor.
+unsigned long snakeTickMs() {
+  int t = 150 - snakeScore * 3;
+  return t < 85 ? 85 : t;
+}
 
 void snakePlaceFood() {
   bool ok = false;
@@ -5012,6 +5126,7 @@ void snakePlaceFood() {
 }
 
 void snakeInitGame() {
+  if (snakeBest < 0) loadSnakeBest();
   snakeLen = 3;
   int startX = snakeGridCols / 2;
   int startY = snakeGridRows / 2;
@@ -5020,44 +5135,101 @@ void snakeInitGame() {
     snakeY[i] = startY;
   }
   snakeDir = SNAKE_RIGHT;
-  snakeNextDir = SNAKE_RIGHT;
+  snakeQueueLen = 0;
   snakeGameOver = false;
+  snakeWaiting = true;
   snakeScore = 0;
   snakeLastTickMs = millis();
   snakePlaceFood();
 }
 
 void drawSnakeScore() {
-  tft.fillRect(0, 24, 240, 16, COLOR_BG);
+  tft.fillRect(0, 25, 240, 18, COLOR_BG);
   char buf[24];
-  sprintf(buf, "Score: %d", snakeScore);
-  tft.setTextColor(COLOR_SUBTEXT);
+  tft.setFont(&SynSmallBold);
   tft.setTextSize(1);
-  tft.setCursor(94, 30);
+  tft.setTextColor(COLOR_TEXT);
+  snprintf(buf, sizeof(buf), "Score  %d", snakeScore);
+  tft.setCursor(snakeFieldX, 38);
   tft.print(buf);
+  snprintf(buf, sizeof(buf), "Best  %d", snakeBest < 0 ? 0 : snakeBest);
+  int16_t x1, y1; uint16_t tw, th;
+  tft.getTextBounds(buf, 0, 0, &x1, &y1, &tw, &th);
+  tft.setTextColor(COLOR_SUBTEXT);
+  tft.setCursor(snakeFieldX + snakeFieldW - tw - x1, 38);
+  tft.print(buf);
+  tft.setFont();
 }
 
+// ---- drawing one square at a time ----
+uint16_t snakeCellBg(int cx, int cy) {
+  return ((cx + cy) & 1) ? COLOR_SURFACE : blendColor(COLOR_SURFACE, COLOR_FRAME, 45);
+}
+
+void snakeDrawEmpty(int cx, int cy) {
+  tft.fillRect(snakeFieldX + cx * SNAKE_CELL, snakeFieldY + cy * SNAKE_CELL, SNAKE_CELL, SNAKE_CELL, snakeCellBg(cx, cy));
+}
+
+void snakeDrawBody(int cx, int cy) {
+  int px = snakeFieldX + cx * SNAKE_CELL, py = snakeFieldY + cy * SNAKE_CELL;
+  tft.fillRect(px, py, SNAKE_CELL, SNAKE_CELL, snakeCellBg(cx, cy));
+  tft.fillRoundRect(px + 1, py + 1, SNAKE_CELL - 2, SNAKE_CELL - 2, 3, COLOR_ACCENT);
+}
+
+void snakeDrawHead(int cx, int cy) {
+  int px = snakeFieldX + cx * SNAKE_CELL, py = snakeFieldY + cy * SNAKE_CELL;
+  tft.fillRect(px, py, SNAKE_CELL, SNAKE_CELL, snakeCellBg(cx, cy));
+  tft.fillRoundRect(px + 1, py + 1, SNAKE_CELL - 2, SNAKE_CELL - 2, 4, darkerColor(COLOR_ACCENT, 6));
+  // two eyes on the side it is heading toward
+  int ex1, ey1, ex2, ey2;
+  if (snakeDir == SNAKE_RIGHT)     { ex1 = px + 8; ey1 = py + 3; ex2 = px + 8; ey2 = py + 7; }
+  else if (snakeDir == SNAKE_LEFT) { ex1 = px + 2; ey1 = py + 3; ex2 = px + 2; ey2 = py + 7; }
+  else if (snakeDir == SNAKE_UP)   { ex1 = px + 3; ey1 = py + 2; ex2 = px + 7; ey2 = py + 2; }
+  else                             { ex1 = px + 3; ey1 = py + 8; ex2 = px + 7; ey2 = py + 8; }
+  tft.fillRect(ex1, ey1, 2, 2, ILI9341_WHITE);
+  tft.fillRect(ex2, ey2, 2, 2, ILI9341_WHITE);
+}
+
+void snakeDrawFood() {
+  int px = snakeFieldX + snakeFoodX * SNAKE_CELL, py = snakeFieldY + snakeFoodY * SNAKE_CELL;
+  tft.fillRect(px, py, SNAKE_CELL, SNAKE_CELL, snakeCellBg(snakeFoodX, snakeFoodY));
+  tft.fillCircle(px + 6, py + 6, 4, COLOR_ERROR);
+  tft.fillRect(px + 6, py, 2, 3, COLOR_HOMEWORK);        // little stem
+}
+
+// The whole board. Only used when the screen opens or a game restarts.
 void drawSnakeField() {
-  tft.fillRect(snakeFieldX, snakeFieldY, snakeFieldW, snakeFieldH, COLOR_SURFACE);
   tft.drawRect(snakeFieldX - 1, snakeFieldY - 1, snakeFieldW + 2, snakeFieldH + 2, COLOR_SUBTEXT);
+  for (int cy = 0; cy < snakeGridRows; cy++)
+    for (int cx = 0; cx < snakeGridCols; cx++) snakeDrawEmpty(cx, cy);
+  snakeDrawFood();
+  for (int i = snakeLen - 1; i > 0; i--) snakeDrawBody(snakeX[i], snakeY[i]);
+  snakeDrawHead(snakeX[0], snakeY[0]);
+}
 
-  tft.fillRect(snakeFieldX + snakeFoodX * SNAKE_CELL + 1, snakeFieldY + snakeFoodY * SNAKE_CELL + 1,
-               SNAKE_CELL - 2, SNAKE_CELL - 2, COLOR_ERROR);
-
-  for (int i = 0; i < snakeLen; i++) {
-    uint16_t c = (i == 0) ? COLOR_HOMEWORK : COLOR_ACCENT;
-    tft.fillRect(snakeFieldX + snakeX[i] * SNAKE_CELL + 1, snakeFieldY + snakeY[i] * SNAKE_CELL + 1,
-                 SNAKE_CELL - 2, SNAKE_CELL - 2, c);
-  }
+void drawSnakeHint(const char* text) {
+  tft.fillRect(0, snakeFieldY + snakeFieldH + 2, 240, 320 - (snakeFieldY + snakeFieldH + 2), COLOR_BG);
+  tft.setFont();
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_SUBTEXT);
+  int16_t x1, y1; uint16_t tw, th;
+  tft.getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor((240 - tw) / 2, snakeFieldY + snakeFieldH + 10);
+  tft.print(text);
 }
 
 void drawSnakeGameOverOverlay() {
-  tft.fillRoundRect(30, 120, 180, 90, 16, COLOR_ERROR);
-  printCentered(&FreeSansBold12pt7b, 120, 145, "Game Over", ILI9341_WHITE);
+  // a card big enough for all four lines, centered on the board
+  int bx = 26, by = snakeFieldY + 56, bw = 188, bh = 124;
+  tft.fillRoundRect(bx + 3, by + 4, bw, bh, 16, COLOR_SHADOW);
+  tft.fillRoundRect(bx, by, bw, bh, 16, COLOR_ERROR);
+  printCentered(&FreeSansBold12pt7b, 120, by + 14, "Game Over", ILI9341_WHITE);
   char buf[24];
-  sprintf(buf, "Score: %d", snakeScore);
-  printCentered(&FreeSans12pt7b, 120, 172, buf, ILI9341_WHITE);
-  printCentered(&FreeSans12pt7b, 120, 195, "Tap field to retry", ILI9341_WHITE);
+  snprintf(buf, sizeof(buf), "Score: %d", snakeScore);
+  printCentered(&FreeSansBold9pt7b, 120, by + 46, buf, ILI9341_WHITE);
+  snprintf(buf, sizeof(buf), snakeScore > 0 && snakeScore >= snakeBest ? "New best!" : "Best: %d", snakeBest);
+  printCentered(&FreeSans9pt7b, 120, by + 68, buf, ILI9341_WHITE);
+  printCentered(&FreeSans9pt7b, 120, by + 96, "Tap to play again", ILI9341_WHITE);
 }
 
 void drawSnakeScreen() {
@@ -5065,11 +5237,8 @@ void drawSnakeScreen() {
   drawBackBar("Snake");
   drawSnakeScore();
   drawSnakeField();
-  if (!snakeGameOver) {
-    printCentered(&FreeSans9pt7b, 120, snakeFieldY + snakeFieldH + 6, "Swipe field to steer", COLOR_SUBTEXT);
-  } else {
-    drawSnakeGameOverOverlay();
-  }
+  if (snakeGameOver) drawSnakeGameOverOverlay();
+  drawSnakeHint(snakeGameOver ? "" : snakeWaiting ? "Swipe on the board to start" : "Swipe to steer");
 }
 
 bool touchedSnakeField(int x, int y) {
@@ -5077,14 +5246,19 @@ bool touchedSnakeField(int x, int y) {
 }
 
 void snakeApplyDirection(SnakeDir d) {
-  // Ignore a swipe that would reverse the snake straight into its own body.
-  if ((snakeDir == SNAKE_UP && d == SNAKE_DOWN) ||
-      (snakeDir == SNAKE_DOWN && d == SNAKE_UP) ||
-      (snakeDir == SNAKE_LEFT && d == SNAKE_RIGHT) ||
-      (snakeDir == SNAKE_RIGHT && d == SNAKE_LEFT)) {
-    return;
+  // The first swipe starts the game (any direction except straight back).
+  SnakeDir last = snakeQueueLen > 0 ? snakeQueue[snakeQueueLen - 1] : snakeDir;
+  // Ignore a swipe that would reverse the snake straight into its own body,
+  // or that repeats the way it is already going.
+  if ((last == SNAKE_UP && d == SNAKE_DOWN) || (last == SNAKE_DOWN && d == SNAKE_UP) ||
+      (last == SNAKE_LEFT && d == SNAKE_RIGHT) || (last == SNAKE_RIGHT && d == SNAKE_LEFT)) return;
+  if (snakeWaiting) {
+    snakeWaiting = false;
+    snakeLastTickMs = millis();
+    drawSnakeHint("Swipe to steer");
   }
-  snakeNextDir = d;
+  if (d == last) return;
+  if (snakeQueueLen < 2) snakeQueue[snakeQueueLen++] = d;
 }
 
 void handleSnakeTouch(int x, int y) {
@@ -5125,11 +5299,15 @@ void handleSnakeSwipe(int x, int y, bool isNewTouch) {
 }
 
 void updateSnakeGame() {
-  if (snakeGameOver) return;
-  if (millis() - snakeLastTickMs < SNAKE_TICK_MS) return;
+  if (snakeGameOver || snakeWaiting) return;
+  if (millis() - snakeLastTickMs < snakeTickMs()) return;
   snakeLastTickMs = millis();
 
-  snakeDir = snakeNextDir;
+  if (snakeQueueLen > 0) {                       // take the next waiting turn
+    snakeDir = snakeQueue[0];
+    snakeQueue[0] = snakeQueue[1];
+    snakeQueueLen--;
+  }
   int nx = snakeX[0];
   int ny = snakeY[0];
   if (snakeDir == SNAKE_UP) ny--;
@@ -5137,18 +5315,25 @@ void updateSnakeGame() {
   else if (snakeDir == SNAKE_LEFT) nx--;
   else nx++;
 
+  bool ate = (nx == snakeFoodX && ny == snakeFoodY);
   bool crashed = (nx < 0 || nx >= snakeGridCols || ny < 0 || ny >= snakeGridRows);
-  for (int i = 0; i < snakeLen && !crashed; i++) {
+  // the tail square is about to move away, so running into it is fine (unless growing)
+  for (int i = 0; i < snakeLen - (ate ? 0 : 1) && !crashed; i++) {
     if (snakeX[i] == nx && snakeY[i] == ny) crashed = true;
   }
   if (crashed) {
     snakeGameOver = true;
+    if (snakeScore > snakeBest) { snakeBest = snakeScore; saveSnakeBest(); }
+    drawSnakeScore();
     drawSnakeGameOverOverlay();
+    drawSnakeHint("");
     return;
   }
 
-  bool ate = (nx == snakeFoodX && ny == snakeFoodY);
+  int tailX = snakeX[snakeLen - 1], tailY = snakeY[snakeLen - 1];
+  int oldHeadX = snakeX[0], oldHeadY = snakeY[0];
   if (ate && snakeLen < SNAKE_MAX_LEN - 1) snakeLen++;
+  else if (!ate) snakeDrawEmpty(tailX, tailY);    // the tail leaves its square
 
   for (int i = snakeLen - 1; i > 0; i--) {
     snakeX[i] = snakeX[i - 1];
@@ -5157,13 +5342,15 @@ void updateSnakeGame() {
   snakeX[0] = nx;
   snakeY[0] = ny;
 
+  snakeDrawBody(oldHeadX, oldHeadY);              // where the head was is now body
+  snakeDrawHead(nx, ny);
+
   if (ate) {
     snakeScore++;
     snakePlaceFood();
+    snakeDrawFood();
     drawSnakeScore();
   }
-
-  drawSnakeField();
 }
 
 // ============================================================

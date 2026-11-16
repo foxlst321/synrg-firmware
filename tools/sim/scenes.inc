@@ -155,4 +155,27 @@ void runScenes() {
   tap(120, 295); shot("news_ticker_off");
   newsTickerOn = true;
   openMessages(); shot("sharenote");
+
+  // ---- v3.8 ----
+  currentTheme = THEME_OLED; applyTheme(currentTheme);
+  weatherCode = 2; strcpy(weatherTemp, "54"); strcpy(weatherDesc, "Partly Cloudy"); weatherHigh = 61; weatherLow = 43;
+  currentScreen = SCREEN_WEATHER; drawWeatherScreen(); shot("v38_weather");
+  strcpy(weatherStatus, "Couldn't update - try again"); drawWeatherScreen(); shot("v38_weather_fail"); weatherStatus[0] = 0;
+  contacts[0].rtx = true; contacts[0].unread = 1;
+  openMessages(); shot("v38_rtx_list");
+  openChat(0); shot("v38_rtx_chat");
+  chatTyping = true; drawChatScreen(); shot("v38_chat_typing_long");
+  chatTyping = false;
+  contacts[0].unread = 1; currentScreen = SCREEN_LOCK; drawLockScreen(clockNow()); shot("v38_rtx_lock");
+  // Snake: start, play some steps with turns, eat, crash
+  snakeInitGame(); currentScreen = SCREEN_SNAKE; drawSnakeScreen(); shot("v38_snake_start");
+  snakeApplyDirection(SNAKE_UP);
+  for (int i = 0; i < 4; i++) { simMillis += 200; updateSnakeGame(); }
+  snakeApplyDirection(SNAKE_RIGHT); snakeApplyDirection(SNAKE_DOWN);
+  snakeFoodX = snakeX[0] + 1; snakeFoodY = snakeY[0]; snakeDrawFood();
+  for (int i = 0; i < 3; i++) { simMillis += 200; updateSnakeGame(); }
+  shot("v38_snake_play");
+  for (int i = 0; i < 30; i++) { simMillis += 200; updateSnakeGame(); }
+  shot("v38_snake_over");
+  currentTheme = 0; applyTheme(0); snakeInitGame(); drawSnakeScreen(); shot("v38_snake_nook");
 }
