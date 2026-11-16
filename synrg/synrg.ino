@@ -78,7 +78,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v3.2"
+#define FIRMWARE_VERSION "v3.3"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -227,6 +227,24 @@ const int presetThemeCount = sizeof(themes) / sizeof(themes[0]);
 const int THEME_CUSTOM = presetThemeCount;   // index just past the presets
 const int themeCount = presetThemeCount + 1;
 
+// ---- Secret theme: a black-and-green tribute to Jensen Huang. It stays
+// hidden until the firmware line on the About screen is tapped 7 times;
+// after that it shows up at the bottom of the Theme list. Kept outside
+// themes[] so the saved numbers of the normal themes never change. ----
+const int THEME_SECRET = themeCount;         // index just past Custom
+const Theme secretTheme =
+  {"Jensen",   {8,10,8},      {236,240,232}, {150,165,140}, {118,185,0},   {34,54,0},     {230,80,80},  {52,66,40},    {0,0,0},       {26,30,24},
+               {118,185,0},   {64,104,0},    {92,150,16},   {150,196,48},  {66,74,62},    {44,72,6}};
+bool secretUnlocked = false;
+int secretTapCount = 0;
+
+void loadSecretUnlocked() { secretUnlocked = LittleFS.exists("/jensen.txt"); }
+void saveSecretUnlocked() {
+  File f = LittleFS.open("/jensen.txt", FILE_WRITE);
+  if (f) { f.print(1); f.close(); }
+}
+int shownThemeCount() { return secretUnlocked ? themeCount + 1 : themeCount; }
+
 const char* customBaseNames[2] = {"Light", "Dark"};
 const RGB customAccents[8] = {
   {110,175,100}, {90,150,220}, {0,170,170}, {150,110,210},
@@ -248,7 +266,8 @@ void loadThemeSettings() {
   f.close();
   int t = 0, b = 0, a = 0;
   sscanf(buf, "%d,%d,%d", &t, &b, &a);
-  currentTheme = (t >= 0 && t < themeCount) ? t : 0;
+  loadSecretUnlocked();
+  currentTheme = (t >= 0 && t < shownThemeCount()) ? t : 0;
   customBase = (b == 1) ? 1 : 0;
   customAccent = (a >= 0 && a < 8) ? a : 0;
 }
@@ -394,6 +413,8 @@ Theme themeFor(int idx) {
     RGB a = customAccents[customAccent];
     t.accent = a;
     t.statusbar = darkenRGB(a, 40);
+  } else if (idx == THEME_SECRET) {
+    t = secretTheme;
   } else if (idx >= 0 && idx < presetThemeCount) {
     t = themes[idx];
   }
@@ -417,7 +438,7 @@ void applyTheme(int idx) {
   COLOR_WEATHER   = rgb565(t.weather);
   COLOR_SETTINGS  = rgb565(t.settings);
   COLOR_MORE      = rgb565(t.more);
-  COLOR_BLUE      = tft.color565(90, 150, 220);
+  COLOR_BLUE      = (idx == THEME_SECRET) ? tft.color565(0, 150, 96) : tft.color565(90, 150, 220);
   COLOR_GRAY      = tft.color565(170, 170, 170);
 
   tileColors[0] = COLOR_MORE;      // widget tile background
@@ -3067,6 +3088,10 @@ void drawBootScreen() {
   tft.drawCircle(cx, cy, 39, COLOR_ACCENT); tft.drawCircle(cx, cy, 40, COLOR_ACCENT);
   delay(90);
   printCentered(&FreeSansBold18pt7b, 120, 186, "SynRG", COLOR_TEXT);
+  if (currentTheme == THEME_SECRET) {
+    printCentered(&FreeSans9pt7b, 120, 226, "The more you buy,", COLOR_ACCENT);
+    printCentered(&FreeSans9pt7b, 120, 246, "the more you save.", COLOR_ACCENT);
+  }
   tft.setTextColor(COLOR_SUBTEXT);
   tft.setTextSize(1);
   char v[24];
@@ -4639,7 +4664,7 @@ void drawSettingsScreen() {
     } else if (action == MORE_ACTION_DEVICE_NAME) {
       snprintf(label, sizeof(label), "Name: %s", deviceName);
     } else if (action == MORE_ACTION_THEME) {
-      snprintf(label, sizeof(label), "Theme: %s", currentTheme == THEME_CUSTOM ? "Custom" : themes[currentTheme].name);
+      snprintf(label, sizeof(label), "Theme: %s", currentTheme == THEME_CUSTOM ? "Custom" : themeFor(currentTheme).name);
     } else {
       snprintf(label, sizeof(label), "%s", moreItemName(action));
     }
@@ -4738,38 +4763,38 @@ void drawThemeSwatches(int x, int y, RGB bg, RGB accent, RGB bar, RGB tile) {
   tft.drawRect(x - 1, y - 1, 50, 22, COLOR_SUBTEXT);
 }
 
+// Rows get a little shorter once the secret theme adds an eighth one.
+int themeRowPitch() { return secretUnlocked ? 36 : 40; }
+
 void drawThemesScreen() {
   tft.fillScreen(COLOR_BG);
   drawScreenFrame();
   drawBackBar("Theme");
 
-  for (int i = 0; i < themeCount; i++) {
-    int rowY = 30 + i * 40;
+  int pitch = themeRowPitch(), h = pitch - 6;
+  for (int i = 0; i < shownThemeCount(); i++) {
+    int rowY = 30 + i * pitch;
     bool selected = (i == currentTheme);
-    drawGlassRect(12, rowY, 216, 34, 14, selected ? COLOR_ACCENT : COLOR_SURFACE);
+    drawGlassRect(12, rowY, 216, h, 14, selected ? COLOR_ACCENT : COLOR_SURFACE);
 
-    if (i == THEME_CUSTOM) {
-      Theme base = themes[customBase == 1 ? 1 : 0];
-      RGB a = customAccents[customAccent];
-      drawThemeSwatches(22, rowY + 7, base.bg, a, darkenRGB(a, 40), base.todo);
-    } else {
-      drawThemeSwatches(22, rowY + 7, themes[i].bg, themes[i].accent, themes[i].statusbar, themes[i].todo);
-    }
+    Theme t = themeFor(i);                       // Custom resolves to its base + accent
+    drawThemeSwatches(22, rowY + (h - 20) / 2, t.bg, t.accent, t.statusbar, t.todo);
 
-    const char* name = (i == THEME_CUSTOM) ? "Custom >" : themes[i].name;
+    const char* name = (i == THEME_CUSTOM) ? "Custom >" : t.name;
     tft.setFont(&FreeSansBold12pt7b);
     tft.setTextSize(1);
     tft.setTextColor(selected ? ILI9341_WHITE : COLOR_TEXT);
-    tft.setCursor(84, rowY + 24);
+    tft.setCursor(84, rowY + h / 2 + 7);
     tft.print(name);
     tft.setFont();
   }
 }
 
 void handleThemesTouch(int x, int y) {
-  for (int i = 0; i < themeCount; i++) {
-    int rowY = 30 + i * 40;
-    if (x >= 12 && x <= 228 && y >= rowY && y <= rowY + 34) {
+  int pitch = themeRowPitch(), h = pitch - 6;
+  for (int i = 0; i < shownThemeCount(); i++) {
+    int rowY = 30 + i * pitch;
+    if (x >= 12 && x <= 228 && y >= rowY && y <= rowY + h) {
       if (i == THEME_CUSTOM) {
         currentTheme = THEME_CUSTOM;
         applyTheme(currentTheme);
@@ -4785,6 +4810,25 @@ void handleThemesTouch(int x, int y) {
       return;
     }
   }
+}
+
+// The reveal when the secret is found: switch to the theme and say so.
+void unlockSecretTheme() {
+  secretUnlocked = true;
+  saveSecretUnlocked();
+  currentTheme = THEME_SECRET;
+  applyTheme(currentTheme);
+  saveThemeSettings();
+
+  tft.fillScreen(ILI9341_BLACK);
+  for (int r = 4; r <= 40; r += 4) { tft.drawCircle(120, 96, r, COLOR_ACCENT); delay(25); }
+  tft.fillCircle(120, 96, 14, COLOR_ACCENT);
+  printCentered(&FreeSansBold18pt7b, 120, 160, "Jensen Mode", COLOR_ACCENT);
+  printCentered(&FreeSans9pt7b, 120, 206, "Secret theme unlocked", ILI9341_WHITE);
+  printCentered(&FreeSans9pt7b, 120, 244, "\"The more you buy,", COLOR_SUBTEXT);
+  printCentered(&FreeSans9pt7b, 120, 264, "the more you save.\"", COLOR_SUBTEXT);
+  delay(2600);
+  drawMoreAboutScreen();
 }
 
 // ============================================================
@@ -5466,8 +5510,11 @@ void loop() {
 
     case SCREEN_MORE_ABOUT:
       if (justTouched && touchedBack(touchX, touchY)) {
+        secretTapCount = 0;
         currentScreen = SCREEN_SETTINGS;
         drawSettingsScreen();
+      } else if (justTouched && touchY >= 40 && touchY <= 68 && !secretUnlocked) {
+        if (++secretTapCount >= 7) { secretTapCount = 0; unlockSecretTheme(); }   // shh
       }
       break;
 

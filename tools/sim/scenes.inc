@@ -69,4 +69,15 @@ void runScenes() {
   tap(120, 295);                 // Add Task
   tap(60, 95); tap(84, 95); tap(200, 228);   // type 2, delete 1
   shot("tap_keyboard");
+
+  // secret theme: 7 taps on the firmware line in About
+  currentScreen = SCREEN_MORE_ABOUT; drawMoreAboutScreen();
+  for (int i = 0; i < 7; i++) tap(80, 54);
+  shot("jensen_about");
+  currentScreen = SCREEN_THEMES; drawThemesScreen(); shot("jensen_themes");
+  currentScreen = SCREEN_HOME; drawHomeScreen(clockNow()); shot("jensen_home");
+  currentScreen = SCREEN_LOCK; drawLockScreen(clockNow()); shot("jensen_lock");
+  drawBootScreen(); shot("jensen_boot");
+  openChat(0); shot("jensen_chat");
+  settingsCategory = -1; currentScreen = SCREEN_SETTINGS; drawSettingsScreen(); shot("jensen_settings");
 }
