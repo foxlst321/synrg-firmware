@@ -34,6 +34,7 @@
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSansBold24pt7b.h>
+#include "SynFonts.h"
 
 // ============================================================
 // HARDWARE PINS
@@ -58,6 +59,8 @@
 #define MSG_TEXT_MAX 60
 #define BUBBLE_CHARS 24        // characters per line in a chat bubble
 #define BUBBLE_MAX_LINES 5
+// A pressable button on screen (see drawGlassRect / flashPressedButton).
+struct ButtonRect { int16_t x, y, w, h, r; uint16_t color; };
 struct Contact { char name[DEVICE_NAME_MAX + 1]; char ip[16]; int unread; };
 struct MsgLine { char dir; char ip[16]; char when[9]; char text[MSG_TEXT_MAX + 1]; };
 
@@ -75,7 +78,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v3.0"
+#define FIRMWARE_VERSION "v3.1"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -296,7 +299,39 @@ void saveThemeSettings() {
   if (f) { f.printf("%d,%d,%d", currentTheme, customBase, customAccent); f.close(); }
 }
 
-Adafruit_ILI9341 tft = Adafruit_ILI9341(&SPI, TFT_DC, TFT_CS, TFT_RST);
+// ---- The display. A thin layer over the ILI9341 driver that replaces the
+// blocky built-in 6x8 font with SynSmall everywhere: code that asks for the
+// "default" font (tft.setFont() with no argument) gets SynSmall at size 1
+// and FreeSansBold9pt at size 2+, and setCursor() keeps meaning "top-left
+// of the text" for those, exactly like the built-in font did. It also
+// forgets the pressable-button list whenever the screen is wiped. ----
+#define MAX_BUTTON_RECTS 72
+ButtonRect buttonRects[MAX_BUTTON_RECTS];
+int buttonRectCount = 0;
+
+class SynDisplay : public Adafruit_ILI9341 {
+  bool smallMode = true;
+  uint8_t wantedSize = 1;
+  int8_t yOff = 8;
+  void applySmall() {
+    Adafruit_GFX::setTextSize(1);
+    if (wantedSize >= 2) { Adafruit_GFX::setFont(&FreeSansBold9pt7b); yOff = 13; }
+    else { Adafruit_GFX::setFont(&SynSmall); yOff = 8; }
+  }
+ public:
+  using Adafruit_ILI9341::Adafruit_ILI9341;
+  void setFont(const GFXfont* f = NULL) {
+    if (f) { smallMode = false; yOff = 0; Adafruit_GFX::setFont(f); Adafruit_GFX::setTextSize(wantedSize); }
+    else { smallMode = true; applySmall(); }
+  }
+  void setTextSize(uint8_t sz) {
+    wantedSize = sz;
+    if (smallMode) applySmall(); else Adafruit_GFX::setTextSize(sz);
+  }
+  void setCursor(int16_t x, int16_t y) { Adafruit_GFX::setCursor(x, y + yOff); }
+  void fillScreen(uint16_t color) { buttonRectCount = 0; Adafruit_ILI9341::fillScreen(color); }
+};
+SynDisplay tft(&SPI, TFT_DC, TFT_CS, TFT_RST);
 XPT2046_Touchscreen ts(T_CS);
 
 
@@ -1864,7 +1899,14 @@ void drawChatMessages(int top, int bottom) {
     int n = wrapMessage(m.text, lines);
     int widest = 1;
     for (int l = 0; l < n; l++) if ((int)strlen(lines[l]) > widest) widest = strlen(lines[l]);
-    int w = widest * 6 + 14, h = n * 10 + 8;
+    int widestPx = 6;
+    tft.setFont();
+    for (int l = 0; l < n; l++) {
+      int16_t bx1, by1; uint16_t bw, bh;
+      tft.getTextBounds(lines[l], 0, 0, &bx1, &by1, &bw, &bh);
+      if ((int)bw > widestPx) widestPx = bw;
+    }
+    int w = widestPx + 16, h = n * 11 + 8;
 
     // time row: under the last bubble of a run from the same side & minute
     bool showTime = failed || (k == total - 1);
@@ -1885,7 +1927,7 @@ void drawChatMessages(int top, int bottom) {
       tft.fillTriangle(x + 10, y + h - 1, x + 1, y + h - 8, x - 4, y + h + 2, fill);
     }
     tft.setTextColor(out ? ILI9341_WHITE : COLOR_TEXT);
-    for (int l = 0; l < n; l++) { tft.setCursor(x + 7, y + 5 + l * 10); tft.print(lines[l]); }
+    for (int l = 0; l < n; l++) { tft.setCursor(x + 8, y + 4 + l * 11); tft.print(lines[l]); }
 
     if (failed) {                                   // red "!" beside the bubble
       tft.fillCircle(x - 10, y + h / 2, 6, COLOR_ERROR);
@@ -2195,27 +2237,27 @@ void printCentered(const GFXfont* font, int centerX, int topY, const char* text,
   tft.setFont();
 }
 
+// Centered text that steps down a size when it doesn't fit: the font asked
+// for, then bold 9pt (for the big fonts), then the small bold UI font.
 void printFitted(const GFXfont* font, int centerX, int topY, const char* text, uint16_t color, int maxWidth) {
-  tft.setFont(font);
-  tft.setTextSize(1);
+  const GFXfont* tries[3] = {font, &FreeSansBold9pt7b, &SynSmallBold};
+  int dropY[3] = {0, 2, 5};          // smaller text sits a little lower to stay centered
+  bool big = (font == &FreeSans12pt7b || font == &FreeSansBold12pt7b ||
+              font == &FreeSansBold18pt7b || font == &FreeSansBold24pt7b);
   int16_t x1, y1; uint16_t tw, th;
-  tft.getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
-
-  if ((int)tw <= maxWidth) {
-    tft.setTextColor(color);
-    tft.setCursor(centerX - (int)(tw / 2) - x1, topY - y1);
-    tft.print(text);
-    tft.setFont();
-    return;
+  for (int i = 0; i < 3; i++) {
+    if (i == 1 && !big) continue;
+    tft.setFont(tries[i]);
+    tft.setTextSize(1);
+    tft.getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
+    if ((int)tw <= maxWidth || i == 2) {
+      tft.setTextColor(color);
+      tft.setCursor(centerX - (int)(tw / 2) - x1, topY + (big ? dropY[i] : (i == 2 ? 2 : 0)) - y1);
+      tft.print(text);
+      break;
+    }
   }
-
   tft.setFont();
-  tft.setTextSize(1);
-  int16_t cx1, cy1; uint16_t ctw, cth;
-  tft.getTextBounds(text, 0, 0, &cx1, &cy1, &ctw, &cth);
-  tft.setTextColor(color);
-  tft.setCursor(centerX - (int)(ctw / 2), topY + 6);
-  tft.print(text);
 }
 
 void drawTempWithDegree(const char* tempNum, int centerX, int topY, uint16_t color) {
@@ -2353,6 +2395,8 @@ void maybeReinitDisplay(DateTime now) {
 // SHARED: soft rounded button with a drop shadow
 // ============================================================
 void drawGlassRect(int x, int y, int w, int h, int r, uint16_t baseColor) {
+  // remember it, so a tap can flash it (see flashPressedButton)
+  if (buttonRectCount < MAX_BUTTON_RECTS) buttonRects[buttonRectCount++] = {(int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h, (int16_t)r, baseColor};
   tft.fillRoundRect(x + 3, y + 4, w, h, r, COLOR_SHADOW);
 
   tft.fillRoundRect(x, y, w, h, r, baseColor);
@@ -2364,6 +2408,44 @@ void drawGlassRect(int x, int y, int w, int h, int r, uint16_t baseColor) {
   uint8_t bd = bb > 5 ? bb - 5 : 0;
   uint16_t border = (rd << 11) | (gd << 5) | bd;
   tft.drawRoundRect(x, y, w, h, r, border);
+}
+
+// ---- Press feedback: every button drawn with drawGlassRect is remembered;
+// a tap draws a dark ring just inside the one under the finger before its
+// action runs. If the action didn't redraw the screen, the ring is removed
+// again afterwards. ----
+uint16_t darkerColor(uint16_t c, int amt) {
+  int rr = (c >> 11) & 0x1F, gg = (c >> 5) & 0x3F, bb = c & 0x1F;
+  rr = rr > amt ? rr - amt : 0; gg = gg > amt * 2 ? gg - amt * 2 : 0; bb = bb > amt ? bb - amt : 0;
+  return (rr << 11) | (gg << 5) | bb;
+}
+
+int pressedButton = -1;
+
+void drawButtonRing(const ButtonRect& b, uint16_t color) {
+  for (int i = 1; i <= 2; i++)
+    tft.drawRoundRect(b.x + i, b.y + i, b.w - 2 * i, b.h - 2 * i, b.r > i ? b.r - i : 1, color);
+}
+
+void flashPressedButton(int x, int y) {
+  pressedButton = -1;
+  for (int i = buttonRectCount - 1; i >= 0; i--) {       // newest (topmost) first
+    ButtonRect& b = buttonRects[i];
+    if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) {
+      drawButtonRing(b, darkerColor(b.color, 9));
+      pressedButton = i;
+      delay(25);
+      return;
+    }
+  }
+}
+
+// After the tap was handled: if that button is still on screen, un-ring it.
+void releasePressedButton(ButtonRect was) {
+  for (int i = buttonRectCount - 1; i >= 0; i--) {
+    ButtonRect& b = buttonRects[i];
+    if (b.x == was.x && b.y == was.y && b.w == was.w && b.h == was.h) { drawButtonRing(b, b.color); return; }
+  }
 }
 
 void drawScreenFrame() {
@@ -2378,12 +2460,20 @@ void drawBackBar(const char* title) {
   tft.fillRect(0, 0, 240, 24, COLOR_STATUSBAR);
   tft.setTextColor(ILI9341_WHITE);
   tft.setTextSize(1);
-  tft.setCursor(8, 8);
-  tft.print("< Back");
+  // back chevron + label
+  tft.drawLine(12, 7, 7, 12, ILI9341_WHITE);
+  tft.drawLine(7, 12, 12, 17, ILI9341_WHITE);
+  tft.drawLine(13, 7, 8, 12, ILI9341_WHITE);
+  tft.drawLine(8, 12, 13, 17, ILI9341_WHITE);
+  tft.setCursor(18, 7);
+  tft.print("Back");
+  // title in the small bold font, centered
+  tft.setFont(&SynSmallBold);
   int16_t x1, y1; uint16_t tw, th;
   tft.getTextBounds(title, 0, 0, &x1, &y1, &tw, &th);
-  tft.setCursor((240 - tw) / 2, 8);
+  tft.setCursor((240 - tw) / 2 - x1, 16);
   tft.print(title);
+  tft.setFont();
 }
 bool touchedBack(int x, int y) { return x < 110 && y < 32; }
 
@@ -2402,13 +2492,20 @@ void drawKeyRow(const char* row, int y, int keyH, bool upperCase) {
   for (int i = 0; i < len; i++) {
     int x = startX + i * 24;
     drawGlassRect(x, y, 22, keyH, 8, COLOR_SETTINGS);
-    tft.setTextColor(ILI9341_WHITE);
-    tft.setTextSize(1);
     char c = row[i];
     if (upperCase) c = toupper(c);
     char label[2] = {c, '\0'};
-    tft.setCursor(x + 7, y + keyH / 2 - 4);
+    // bold 9pt letter, centered on the key
+    tft.setFont(&FreeSansBold9pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(ILI9341_WHITE);
+    int16_t x1, y1; uint16_t tw, th;
+    tft.getTextBounds("x", 0, 0, &x1, &y1, &tw, &th);       // x-height: keeps a common baseline
+    int baseline = y + keyH / 2 + 5;
+    tft.getTextBounds(label, 0, 0, &x1, &y1, &tw, &th);
+    tft.setCursor(x + 11 - (int)tw / 2 - x1, baseline);
     tft.print(label);
+    tft.setFont();
   }
 }
 
@@ -2435,6 +2532,28 @@ int kbMaxLen() {
   return 36;
 }
 
+// The text box at the top of the keyboard. Typing redraws only this, not
+// the whole screen, so keys respond quickly.
+void drawKeyboardInput() {
+  tft.fillRoundRect(10, 30, 220, 40, 12, COLOR_SURFACE);
+  tft.drawRoundRect(10, 30, 220, 40, 12, COLOR_SUBTEXT);
+  tft.setFont(&FreeSans9pt7b);
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  // Show the end of the text (the part being typed) when it's wider than the box.
+  const char* shown = kbBuffer;
+  int16_t x1, y1; uint16_t tw, th;
+  for (;;) {
+    tft.getTextBounds(shown, 0, 0, &x1, &y1, &tw, &th);
+    if (tw <= 200 || !*shown) break;
+    shown++;
+  }
+  tft.setCursor(18, 56);
+  tft.print(shown);
+  tft.fillRect(18 + tw + 3, 40, 2, 20, COLOR_ACCENT);    // cursor bar
+  tft.setFont();
+}
+
 void drawKeyboardScreen() {
   tft.fillScreen(COLOR_BG);
   const char* title = "Add Task";
@@ -2443,18 +2562,7 @@ void drawKeyboardScreen() {
   if (kbContext == KB_CONTEXT_DEVICE_NAME) title = "Name Your Device";
   if (kbContext == KB_CONTEXT_MSG_IP) title = "Send To (IP)";
   drawBackBar(title);
-
-  tft.fillRoundRect(10, 30, 220, 40, 12, COLOR_SURFACE);
-  tft.drawRoundRect(10, 30, 220, 40, 12, COLOR_SUBTEXT);
-  tft.setTextColor(COLOR_TEXT);
-  tft.setTextSize(2);
-  tft.setCursor(16, 42);
-  // The box only fits 17 big characters, so once the text is longer, show
-  // the end of it (the part being typed) instead of running off the screen.
-  const int showMax = 17;
-  const char* shown = kbBuffer;
-  if (kbBufferLen > showMax) shown = kbBuffer + (kbBufferLen - showMax);
-  tft.print(shown);
+  drawKeyboardInput();
 
   bool upper = (kbMode == KB_MODE_ABC) && kbShift;
   drawKeyRow(kbGetRow1(), 76, 40, upper);
@@ -2491,7 +2599,7 @@ void handleKeyboardTouch(int x, int y) {
       if (kbMode == KB_MODE_ABC && kbShift) insertChar = toupper(c);
       kbBuffer[kbBufferLen++] = insertChar;
       kbBuffer[kbBufferLen] = '\0';
-      drawKeyboardScreen();
+      drawKeyboardInput();
     }
     return;
   }
@@ -2512,7 +2620,7 @@ void handleKeyboardTouch(int x, int y) {
     if (kbBufferLen > 0) {
       kbBufferLen--;
       kbBuffer[kbBufferLen] = '\0';
-      drawKeyboardScreen();
+      drawKeyboardInput();
     }
     return;
   }
@@ -2521,7 +2629,7 @@ void handleKeyboardTouch(int x, int y) {
     if (kbBufferLen < kbMaxLen()) {
       kbBuffer[kbBufferLen++] = ' ';
       kbBuffer[kbBufferLen] = '\0';
-      drawKeyboardScreen();
+      drawKeyboardInput();
     }
     return;
   }
@@ -3890,7 +3998,7 @@ void drawSnakeScreen() {
   drawSnakeScore();
   drawSnakeField();
   if (!snakeGameOver) {
-    printCentered(&FreeSans12pt7b, 120, snakeFieldY + snakeFieldH + 14, "Swipe field to steer", COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, snakeFieldY + snakeFieldH + 6, "Swipe field to steer", COLOR_SUBTEXT);
   } else {
     drawSnakeGameOverOverlay();
   }
@@ -4978,6 +5086,15 @@ void loop() {
     openBannerChat();
     justTouched = false;
   }
+
+  // press feedback (not where touches draw or steer)
+  ButtonRect pressedWas = {0, 0, 0, 0, 0, 0};
+  bool didFlash = false;
+  if (justTouched && currentScreen != SCREEN_NOTES && currentScreen != SCREEN_SNAKE &&
+      currentScreen != SCREEN_TOUCH_CAL && currentScreen != SCREEN_LOCK) {
+    flashPressedButton(touchX, touchY);
+    if (pressedButton >= 0) { pressedWas = buttonRects[pressedButton]; didFlash = true; }
+  }
   if (reqPending && currentScreen != SCREEN_MSG_REQUEST && canShowPopupNow()) showConnectPopup();
 
   wasTouched = touchedNow;
@@ -5314,5 +5431,6 @@ void loop() {
   // Snake movement) at ~33 updates/sec no matter how fast the chip could
   // otherwise go. Dropped way down so the loop runs close to full speed;
   // a tiny delay is kept just to be a good citizen to the WiFi/RTC stack.
+  if (didFlash) releasePressedButton(pressedWas);
   delay(2);
 }
