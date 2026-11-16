@@ -66,7 +66,7 @@ struct MsgLine { char dir; char ip[16]; char when[9]; char text[MSG_TEXT_MAX + 1
 
 enum KeyboardContext { KB_CONTEXT_NONE, KB_CONTEXT_ADD_TODO, KB_CONTEXT_ADD_HOMEWORK, KB_CONTEXT_WIFI_PASSWORD, KB_CONTEXT_DEVICE_NAME, KB_CONTEXT_MSG_IP };
 enum KeyboardMode { KB_MODE_ABC, KB_MODE_123, KB_MODE_SYM };
-enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM, SCREEN_TOUCH_CAL, SCREEN_MESSAGES, SCREEN_CHAT, SCREEN_MSG_REQUEST, SCREEN_NEARBY, SCREEN_NEWS };
+enum Screen { SCREEN_WELCOME, SCREEN_TOUCH_TEST, SCREEN_LOCK, SCREEN_HOME, SCREEN_APP, SCREEN_SETTINGS, SCREEN_SET_TIME, SCREEN_SET_DATE, SCREEN_TODO, SCREEN_HOMEWORK, SCREEN_KEYBOARD, SCREEN_NOTES, SCREEN_WIFI, SCREEN_WIFI_SAVED, SCREEN_WEATHER, SCREEN_MORE_CONFIRM, SCREEN_MORE_ABOUT, SCREEN_SNAKE, SCREEN_HW_PERIOD, SCREEN_OTA, SCREEN_THEMES, SCREEN_THEME_CUSTOM, SCREEN_TOUCH_CAL, SCREEN_MESSAGES, SCREEN_CHAT, SCREEN_MSG_REQUEST, SCREEN_NEARBY, SCREEN_NEWS, SCREEN_ARTICLE };
 enum SnakeDir { SNAKE_UP, SNAKE_DOWN, SNAKE_LEFT, SNAKE_RIGHT };
 enum MoreAction { MORE_ACTION_SET_TIME, MORE_ACTION_SET_DATE, MORE_ACTION_WIFI, MORE_ACTION_ABOUT, MORE_ACTION_UPDATE, MORE_ACTION_CLEAR_TODO, MORE_ACTION_CLEAR_HOMEWORK, MORE_ACTION_CLEAR_NOTES, MORE_ACTION_RUN_SETUP, MORE_ACTION_SNAKE, MORE_ACTION_ANIMATIONS, MORE_ACTION_WIDGET, MORE_ACTION_THEME, MORE_ACTION_DEVICE_NAME, MORE_ACTION_TOUCH_CAL };
 
@@ -78,7 +78,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v3.5"
+#define FIRMWARE_VERSION "v3.6"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -2229,6 +2229,8 @@ void handleChatTouch(int x, int y) {
 #define NEWS_CAT_NVIDIA 6
 #define NEWS_PER_CAT 6
 #define NEWS_TITLE_MAX 110
+#define NEWS_LINK_MAX 260
+#define NEWS_DESC_MAX 400
 struct NewsCat { const char* name; const char* url; };
 const NewsCat newsCats[NEWS_CATS] = {
   {"Top",      "https://feeds.npr.org/1001/rss.xml"},
@@ -2242,6 +2244,8 @@ const NewsCat newsCats[NEWS_CATS] = {
   {"Nvidia",   "https://news.google.com/rss/search?q=Nvidia+OR+%22Jensen+Huang%22&hl=en-US&gl=US&ceid=US:en"},
 };
 char newsTitles[NEWS_CATS][NEWS_PER_CAT][NEWS_TITLE_MAX + 1];
+char newsLinks[NEWS_CATS][NEWS_PER_CAT][NEWS_LINK_MAX + 1];    // each story's web address
+char newsDescs[NEWS_CATS][NEWS_PER_CAT][NEWS_DESC_MAX + 1];    // each story's short summary
 int newsCount[NEWS_CATS] = {0, 0, 0, 0, 0, 0, 0};
 unsigned long newsNextTryMs[NEWS_CATS] = {0, 0, 0, 0, 0, 0, 0};   // when each topic may be fetched again
 int newsMixTheme = -1;                 // theme the blended list was built for
@@ -2302,11 +2306,13 @@ void buildNewsMix() {
   newsTickerDirty = true;
 }
 
-// Turns raw feed text into plain ASCII: drops CDATA wrappers, decodes the
-// common &entities;, and maps curly quotes / dashes to plain ones.
+// Turns raw feed / web text into plain ASCII: drops CDATA wrappers and HTML
+// tags (written plainly or as &lt;...&gt;), decodes the common &entities;,
+// and maps curly quotes / dashes to plain ones.
 void cleanNewsTitle(const char* raw, char* out, size_t outLen) {
   size_t j = 0;
   bool lastSpace = true;
+  bool inTag = false;
   for (size_t i = 0; raw[i] && j < outLen - 1; ) {
     char c = raw[i];
     if (strncmp(raw + i, "<![CDATA[", 9) == 0) { i += 9; continue; }
@@ -2322,6 +2328,11 @@ void cleanNewsTitle(const char* raw, char* out, size_t outLen) {
         else if (!strcmp(ent, "apos")) c = '\'';
         else if (!strcmp(ent, "lt")) c = '<';
         else if (!strcmp(ent, "gt")) c = '>';
+        else if (!strcmp(ent, "nbsp")) c = ' ';
+        else if (!strcmp(ent, "mdash") || !strcmp(ent, "ndash") || !strcmp(ent, "bull")) c = '-';
+        else if (!strcmp(ent, "ldquo") || !strcmp(ent, "rdquo")) c = '"';
+        else if (!strcmp(ent, "lsquo") || !strcmp(ent, "rsquo")) c = '\'';
+        else if (!strcmp(ent, "hellip")) c = '.';
         else if (ent[0] == '#') {
           int v = (ent[1] == 'x' || ent[1] == 'X') ? (int)strtol(ent + 2, NULL, 16) : atoi(ent + 1);
           if (v == 8216 || v == 8217) c = '\'';
@@ -2339,6 +2350,8 @@ void cleanNewsTitle(const char* raw, char* out, size_t outLen) {
       i++;
       continue;
     } else i++;
+    if (c == '<') { inTag = true; continue; }       // skip <tags> entirely
+    if (inTag) { if (c == '>') inTag = false; continue; }
     if (c == '\n' || c == '\r' || c == '\t') c = ' ';
     if (c == ' ' && lastSpace) continue;
     lastSpace = (c == ' ');
@@ -2348,11 +2361,14 @@ void cleanNewsTitle(const char* raw, char* out, size_t outLen) {
   out[j] = '\0';
 }
 
-// ---- streaming RSS reader: feed it one character at a time ----
+// ---- streaming RSS reader: feed it one character at a time. For each
+// <item> it keeps the <title>, <link> and <description>. ----
 char newsWin[10];                    // the last few characters seen
-int newsParseState = 0;              // 0 = before an <item>, 1 = in item before <title, 2 = in the <title ...> tag, 3 = reading the title
-char newsRaw[260];
+int newsParseState = 0;              // 0 = before an <item>, 1 = inside an item, 2 = inside an opening tag, 3 = reading a field
+int newsField = 0;                   // which field is being read: 0 title, 1 link, 2 description
+char newsRaw[700];
 int newsRawLen = 0;
+char newsItemTitle[NEWS_TITLE_MAX + 1], newsItemLink[NEWS_LINK_MAX + 1], newsItemDesc[NEWS_DESC_MAX + 1];
 
 void newsParserReset() { memset(newsWin, 0, sizeof(newsWin)); newsParseState = 0; newsRawLen = 0; }
 
@@ -2366,19 +2382,38 @@ bool newsParserFeed(char c, int cat) {
   memmove(newsWin, newsWin + 1, 8);
   newsWin[8] = c;
   switch (newsParseState) {
-    case 0: if (newsWinEnds("<item")) newsParseState = 1; break;
-    case 1: if (newsWinEnds("<title")) newsParseState = 2; break;
-    case 2: if (c == '>') { newsParseState = 3; newsRawLen = 0; } break;
-    case 3:
-      if (newsRawLen < (int)sizeof(newsRaw) - 1) newsRaw[newsRawLen++] = c;
-      if (newsWinEnds("</title>")) {
-        newsRawLen = newsRawLen >= 8 ? newsRawLen - 8 : 0;
-        newsRaw[newsRawLen] = '\0';
-        cleanNewsTitle(newsRaw, newsTitles[cat][newsCount[cat]], NEWS_TITLE_MAX + 1);
-        if (newsTitles[cat][newsCount[cat]][0]) newsCount[cat]++;
+    case 0:
+      if (newsWinEnds("<item")) { newsParseState = 1; newsItemTitle[0] = newsItemLink[0] = newsItemDesc[0] = '\0'; }
+      break;
+    case 1:
+      if (newsWinEnds("<title")) { newsField = 0; newsParseState = 2; }
+      else if (newsWinEnds("<link")) { newsField = 1; newsParseState = 2; }
+      else if (newsWinEnds("<descript")) { newsField = 2; newsParseState = 2; }
+      else if (newsWinEnds("</item>")) {
+        if (newsItemTitle[0] && newsCount[cat] < NEWS_PER_CAT) {
+          int n = newsCount[cat]++;
+          strcpy(newsTitles[cat][n], newsItemTitle);
+          strcpy(newsLinks[cat][n], newsItemLink);
+          strcpy(newsDescs[cat][n], newsItemDesc);
+        }
         newsParseState = 0;
       }
       break;
+    case 2: if (c == '>') { newsParseState = 3; newsRawLen = 0; } break;
+    case 3: {
+      if (newsRawLen < (int)sizeof(newsRaw) - 1) newsRaw[newsRawLen++] = c;
+      const char* endTag = newsField == 0 ? "</title>" : newsField == 1 ? "</link>" : "</descri";
+      if (newsWinEnds(endTag)) {
+        int cut = strlen(endTag);
+        if (newsRawLen < (int)sizeof(newsRaw) - 1) newsRawLen = newsRawLen >= cut ? newsRawLen - cut : 0;
+        newsRaw[newsRawLen] = '\0';
+        if (newsField == 0) cleanNewsTitle(newsRaw, newsItemTitle, sizeof(newsItemTitle));
+        else if (newsField == 1) cleanNewsTitle(newsRaw, newsItemLink, sizeof(newsItemLink));
+        else cleanNewsTitle(newsRaw, newsItemDesc, sizeof(newsItemDesc));
+        newsParseState = 1;
+      }
+      break;
+    }
   }
   return newsCount[cat] >= NEWS_PER_CAT;
 }
@@ -2588,7 +2623,7 @@ void drawNewsScreen() {
   tft.setFont();
   tft.setTextColor(COLOR_SUBTEXT);
   tft.setCursor(10, 262);
-  tft.print(newsStatus[0] ? newsStatus : currentTheme == THEME_SECRET ? "NPR + Nvidia news" : "Headlines from NPR");
+  tft.print(newsStatus[0] ? newsStatus : newsMixCount > 0 ? "Tap a headline to read it" : "Headlines from NPR");
   if (maxScroll > 0) {
     tft.fillTriangle(196, 274, 204, 262, 212, 274, newsScroll > 0 ? COLOR_TEXT : COLOR_FRAME);
     tft.fillTriangle(218, 262, 226, 274, 234, 262, newsScroll < maxScroll ? COLOR_TEXT : COLOR_FRAME);
@@ -2644,12 +2679,266 @@ void handleNewsTouch(int x, int y) {
     }
     return;
   }
+  for (int row = 0; row < NEWS_ROWS && row + newsScroll < newsMixCount; row++) {   // a headline: open it
+    int ry = NEWS_LIST_Y + row * NEWS_ROW_H;
+    if (y >= ry && y < ry + NEWS_ROW_H - 2) {
+      openArticle(newsMixCat[row + newsScroll], newsMixIdx[row + newsScroll]);
+      return;
+    }
+  }
   int maxScroll = newsMixCount > NEWS_ROWS ? newsMixCount - NEWS_ROWS : 0;
   if (maxScroll > 0 && y >= 256 && y <= 280 && x >= 190) {            // scroll arrows
     if (x < 215) newsScroll = newsScroll > 3 ? newsScroll - 3 : 0;
     else newsScroll = newsScroll + 3 < maxScroll ? newsScroll + 3 : maxScroll;
     drawNewsScreen();
   }
+}
+
+// ============================================================
+// NEWS ARTICLE -- tap a headline to see its summary (from the feed), then
+// "Read full story" downloads NPR's plain-text version of the article
+// (text.npr.org) and shows it a page at a time.
+// ============================================================
+#define ARTICLE_MAX 7000
+#define ARTICLE_MAX_PAGES 40
+char articleText[ARTICLE_MAX + 1];
+int articleLen = 0;
+int articleCat = 0, articleIdx = 0;
+bool articleFull = false;            // false = summary view, true = paging through the full text
+int articlePageStart[ARTICLE_MAX_PAGES + 1];
+int articlePages = 0, articlePage = 0;
+char articleStatus[40] = "";
+
+int fontCharW(const GFXfont* f, char c) {
+  if ((uint8_t)c < f->first || (uint8_t)c > f->last) return 0;
+  return f->glyph[(uint8_t)c - f->first].xAdvance;
+}
+
+// Word-wraps text[start...] into lines at most `w` pixels wide and draws up
+// to maxLines of them (or only measures when draw is false). '\n' starts a
+// new paragraph with a little gap. Returns the index where it stopped.
+int drawWrapped(const GFXfont* f, const char* text, int start, int x, int y, int w, int lineH, int maxLines, bool draw, uint16_t color, int* linesUsed) {
+  bool small = (f == &SynSmall);
+  if (draw) {
+    if (small) tft.setFont(); else tft.setFont(f);
+    tft.setTextSize(1);
+    tft.setTextColor(color);
+  }
+  int pos = start, line = 0;
+  char buf[80];
+  while (text[pos] && line < maxLines) {
+    if (text[pos] == '\n') {                      // paragraph break: skip a line, unless at the top of a page
+      pos++;
+      if (line > 0) line++;
+      continue;
+    }
+    int width = 0, i = pos, lastBreak = -1;
+    while (text[i] && text[i] != '\n') {
+      int cw = fontCharW(f, text[i]);
+      if (width + cw > w) break;
+      width += cw;
+      if (text[i] == ' ') lastBreak = i;
+      i++;
+      if (i - pos >= (int)sizeof(buf) - 1) break;
+    }
+    int end = i;
+    if (text[i] && text[i] != '\n' && lastBreak > pos) end = lastBreak;     // break at the last space
+    if (end == pos) end = pos + 1;                                         // always make progress
+    if (draw) {
+      int n = end - pos;
+      memcpy(buf, text + pos, n); buf[n] = '\0';
+      tft.setCursor(x, small ? y + line * lineH : y + line * lineH + 13);
+      tft.print(buf);
+    }
+    pos = end;
+    while (text[pos] == ' ') pos++;
+    line++;
+  }
+  if (draw) tft.setFont();
+  if (linesUsed) *linesUsed = line;
+  return pos;
+}
+
+const int ART_TEXT_Y = 32, ART_LINE_H = 12, ART_LINES = 20;
+
+void paginateArticle() {
+  articlePages = 0;
+  int pos = 0;
+  while (articleText[pos] && articlePages < ARTICLE_MAX_PAGES) {
+    articlePageStart[articlePages++] = pos;
+    int used;
+    pos = drawWrapped(&SynSmall, articleText, pos, 10, ART_TEXT_Y, 220, ART_LINE_H, ART_LINES, false, 0, &used);
+    while (articleText[pos] == '\n') pos++;
+  }
+  articlePageStart[articlePages] = pos;
+}
+
+void openArticle(int cat, int idx) {
+  articleCat = cat; articleIdx = idx;
+  articleFull = false;
+  articleStatus[0] = '\0';
+  currentScreen = SCREEN_ARTICLE;
+  drawArticleScreen();
+}
+
+void drawArticleScreen() {
+  tft.fillScreen(COLOR_BG);
+  drawScreenFrame();
+  drawBackBar(newsCats[articleCat].name);
+
+  if (articleFull) {
+    drawWrapped(&SynSmall, articleText, articlePageStart[articlePage], 10, ART_TEXT_Y, 220, ART_LINE_H, ART_LINES, true, COLOR_TEXT, NULL);
+    drawGlassRect(8, 284, 72, 28, 12, articlePage > 0 ? COLOR_SETTINGS : COLOR_FRAME);
+    printFitted(&FreeSansBold9pt7b, 44, 291, "Prev", ILI9341_WHITE, 64);
+    char pg[16];
+    snprintf(pg, sizeof(pg), "%d / %d", articlePage + 1, articlePages);
+    printCentered(&FreeSans9pt7b, 120, 291, pg, COLOR_SUBTEXT);
+    drawGlassRect(160, 284, 72, 28, 12, articlePage < articlePages - 1 ? COLOR_ACCENT : COLOR_FRAME);
+    printFitted(&FreeSansBold9pt7b, 196, 291, "Next", ILI9341_WHITE, 64);
+    return;
+  }
+
+  // summary view: headline, topic, then the feed's summary
+  tft.fillRoundRect(8, 32, 4, 14, 2, newsCatColor(articleCat));
+  int used = 0;
+  drawWrapped(&FreeSansBold9pt7b, newsTitles[articleCat][articleIdx], 0, 18, 30, 212, 19, 5, true, COLOR_TEXT, &used);
+  int y = 30 + used * 19 + 10;
+  tft.drawFastHLine(10, y - 4, 220, COLOR_FRAME);
+  const char* desc = newsDescs[articleCat][articleIdx];
+  bool nvidia = (articleCat == NEWS_CAT_NVIDIA);
+  if (nvidia) desc = "This headline comes from Google News. The full story is on the publisher's website, which the PDA can't open.";
+  else if (!desc[0]) desc = "No summary came with this story.";
+  int maxLines = (262 - y) / 13;
+  drawWrapped(&SynSmall, desc, 0, 10, y, 220, 13, maxLines, true, COLOR_SUBTEXT, NULL);
+
+  tft.setFont();
+  if (articleStatus[0]) {
+    tft.setTextColor(COLOR_ERROR);
+    tft.setCursor(10, 266);
+    tft.print(articleStatus);
+  }
+  if (!nvidia) {
+    drawGlassRect(20, 282, 200, 30, 14, COLOR_ACCENT);
+    printFitted(&FreeSansBold9pt7b, 120, 290, "Read full story", ILI9341_WHITE, 190);
+  }
+}
+
+// NPR links look like https://www.npr.org/2025/11/15/nx-s1-5609712/some-title
+// (older ones use a long number instead of nx-s1-...). The text-only site
+// serves the same story at https://text.npr.org/<that id>.
+bool nprTextUrl(const char* link, char* out, size_t len) {
+  const char* p = strstr(link, "npr.org/");
+  if (!p) return false;
+  p += 8;
+  for (int seg = 0; seg < 3; seg++) {             // skip /YYYY/MM/DD/
+    if (!isdigit((unsigned char)*p)) return false;
+    while (isdigit((unsigned char)*p)) p++;
+    if (*p != '/') return false;
+    p++;
+  }
+  char id[40];
+  size_t n = 0;
+  while (p[n] && p[n] != '/' && p[n] != '?' && n < sizeof(id) - 1) { id[n] = p[n]; n++; }
+  id[n] = '\0';
+  if (n < 5) return false;
+  snprintf(out, len, "https://text.npr.org/%s", id);
+  return true;
+}
+
+// ---- streaming reader for the text-only article page: after the <h1>
+// headline, keep the text of every <p>...</p> until </article>. ----
+int artState = 0;                  // 0 = before <h1, 1 = between paragraphs, 2 = inside a <p ...> tag, 3 = paragraph text, 4 = done
+char artRaw[1200];
+int artRawLen = 0;
+
+void articleParserReset() { memset(newsWin, 0, sizeof(newsWin)); artState = 0; artRawLen = 0; articleLen = 0; articleText[0] = '\0'; }
+
+void articleParserFeed(char c) {
+  memmove(newsWin, newsWin + 1, 8);
+  newsWin[8] = c;
+  switch (artState) {
+    case 0: if (newsWinEnds("<h1")) artState = 1; break;
+    case 1:
+      if (newsWinEnds("</article") || newsWinEnds("<footer")) artState = 4;
+      else if (newsWinEnds("<p>")) { artState = 3; artRawLen = 0; }
+      else if (newsWinEnds("<p ")) artState = 2;
+      break;
+    case 2: if (c == '>') { artState = 3; artRawLen = 0; } break;
+    case 3:
+      if (artRawLen < (int)sizeof(artRaw) - 1) artRaw[artRawLen++] = c;
+      if (newsWinEnds("</p>")) {
+        if (artRawLen < (int)sizeof(artRaw) - 1) artRawLen = artRawLen >= 4 ? artRawLen - 4 : 0;
+        artRaw[artRawLen] = '\0';
+        char clean[1200];
+        cleanNewsTitle(artRaw, clean, sizeof(clean));
+        int n = strlen(clean);
+        if (n > 0 && articleLen + n + 2 < ARTICLE_MAX) {
+          memcpy(articleText + articleLen, clean, n);
+          articleLen += n;
+          articleText[articleLen++] = '\n';
+          articleText[articleLen] = '\0';
+        } else if (n > 0) {
+          artState = 4;                            // out of room: stop here
+          return;
+        }
+        artState = 1;
+      }
+      break;
+  }
+}
+
+void loadFullArticle() {
+  char url[80];
+  if (WiFi.status() != WL_CONNECTED) { strcpy(articleStatus, "No WiFi"); drawArticleScreen(); return; }
+  if (!nprTextUrl(newsLinks[articleCat][articleIdx], url, sizeof(url))) {
+    strcpy(articleStatus, "Full story isn't available");
+    drawArticleScreen();
+    return;
+  }
+  tft.fillRect(8, 262, 224, 52, COLOR_BG);
+  printCentered(&FreeSans9pt7b, 120, 284, "Loading story...", COLOR_SUBTEXT);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(8000);
+  http.begin(client, String(url));
+  int code = http.GET();
+  if (code == 200) {
+    articleParserReset();
+    WiFiClient* stream = http.getStreamPtr();
+    unsigned long start = millis(), lastData = millis();
+    while (artState != 4 && millis() - start < 20000 && millis() - lastData < 5000) {
+      if (stream->available() > 0) { articleParserFeed((char)stream->read()); lastData = millis(); }
+      else if (!http.connected()) break;
+      else delay(2);
+    }
+  }
+  http.end();
+
+  if (code == 200 && articleLen > 0) {
+    paginateArticle();
+    articlePage = 0;
+    articleFull = true;
+    articleStatus[0] = '\0';
+  } else if (code == 200) {
+    strcpy(articleStatus, "Couldn't read that story");
+  } else {
+    snprintf(articleStatus, sizeof(articleStatus), "Couldn't load it (%d)", code);
+  }
+  drawArticleScreen();
+}
+
+void handleArticleTouch(int x, int y) {
+  if (articleFull) {
+    if (y < 276) return;
+    if (x < 100 && articlePage > 0) { articlePage--; drawArticleScreen(); }
+    else if (x > 140 && articlePage < articlePages - 1) { articlePage++; drawArticleScreen(); }
+    return;
+  }
+  if (articleCat != NEWS_CAT_NVIDIA && x >= 20 && x <= 220 && y >= 282 && y <= 312) loadFullArticle();
 }
 
 // ---- Device controls on the web page, so the PDA can still be calibrated,
@@ -6078,6 +6367,17 @@ void loop() {
 
     case SCREEN_CHAT:
       if (justTouched) handleChatTouch(touchX, touchY);
+      break;
+
+    case SCREEN_ARTICLE:
+      if (justTouched) {
+        if (touchedBack(touchX, touchY)) {
+          if (articleFull) { articleFull = false; drawArticleScreen(); }   // back to the summary first
+          else { currentScreen = SCREEN_NEWS; drawNewsScreen(); }
+        } else {
+          handleArticleTouch(touchX, touchY);
+        }
+      }
       break;
 
     case SCREEN_NEWS:

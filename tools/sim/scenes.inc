@@ -91,7 +91,7 @@ void runScenes() {
   // ---- News: run sample RSS through the real parser ----
   currentTheme = THEME_OLED; applyTheme(currentTheme);
   { const char* feeds[3] = {
-      "<rss><channel><title>NPR Top</title><item><title>Senate passes spending bill after late-night session, avoiding a government shutdown</title><link>x</link></item>"
+      "<rss><channel><title>NPR Top</title><link>https://www.npr.org/</link><description>top</description><item><title>Senate passes spending bill after late-night session, avoiding a government shutdown</title><description><![CDATA[The vote came just hours before funding was set to lapse. The bill now heads to the House, where leaders say they expect to take it up early next week.<img src='x.png' />]]></description><link>https://www.npr.org/2026/11/16/nx-s1-5609712/senate-passes-spending-bill</link><guid>z</guid></item>"
       "<item><title><![CDATA[Storm brings heavy snow &amp; ice to the Midwest]]></title></item>"
       "<item><title>What we know about the bridge closure</title></item></channel></rss>",
       "<rss><channel><title>Tech</title><item>\n  <title>Chipmakers race to build faster AI processors as demand keeps climbing worldwide this year</title></item>"
@@ -128,4 +128,25 @@ void runScenes() {
   for (int i = 0; i < 90; i++) { simMillis += 45; updateNewsTicker(); }
   shot("home_ticker_jensen");
   currentTheme = THEME_OLED; applyTheme(currentTheme); openNews(); shot("news_after_jensen");
+
+  // ---- article: summary, then a sample text.npr.org page through the real parser ----
+  openNews(); tap(120, 100); shot("article_summary");
+  { char u[80]; nprTextUrl(newsLinks[0][0], u, sizeof(u)); printf("text url: %s\n", u); }
+  { const char* page = "<html><body><header><p>NPR</p><ul><li><a href='/'>Home</a></li></ul></header><article><div class=\"story-head\"><h1 class=\"story-title\">Senate passes spending bill</h1><p>By Jane Reporter</p><p>Monday, November 16, 2026 &bull; 8:02 AM EST</p></div><div class=\"paragraphs-container\">"
+      "<p>WASHINGTON &mdash; The Senate passed a stopgap spending bill late Sunday night, sending the measure to the House with only hours to spare before federal funding was due to run out.</p>"
+      "<p>The vote was 68 to 30, with a group of lawmakers from both parties <a href=\"/x\">joining together</a> after days of negotiation over how long the measure should last and what it should include.</p>"
+      "<p>&ldquo;Nobody got everything they wanted,&rdquo; one senator said after the vote. &ldquo;That is usually how you know it is a real compromise.&rdquo;</p>"
+      "<p>House leaders said they expect to bring the bill to the floor early this week. If it passes there, it would keep agencies running into the new year while talks continue on full-year funding.</p>"
+      "<p>Federal workers had been preparing for the possibility of a shutdown, with agencies sending out notices about who would be asked to keep working without pay.</p>"
+      "<p>Analysts say the short-term deal avoids an immediate crisis but sets up another deadline in a few months, when many of the same disagreements are likely to return.</p>"
+      "<p>The White House said the president would sign the measure as soon as it reaches his desk.</p>"
+      "</div></article><footer><p>Topics</p></footer></body></html>";
+    articleParserReset();
+    for (const char* p = page; *p; p++) articleParserFeed(*p);
+    paginateArticle(); articlePage = 0; articleFull = true; drawArticleScreen(); shot("article_page1");
+    printf("article chars %d pages %d\n", articleLen, articlePages);
+    tap(200, 298); shot("article_page2"); }
+  articleFull = false; strcpy(articleStatus, "Couldn't load it (-1)"); drawArticleScreen(); shot("article_error");
+  currentTheme = THEME_SECRET; applyTheme(currentTheme); openArticle(NEWS_CAT_NVIDIA, 0); shot("article_nvidia");
+  currentTheme = THEME_OLED; applyTheme(currentTheme);
 }
