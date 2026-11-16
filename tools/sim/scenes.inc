@@ -149,4 +149,10 @@ void runScenes() {
   articleFull = false; strcpy(articleStatus, "Couldn't load it (-1)"); drawArticleScreen(); shot("article_error");
   currentTheme = THEME_SECRET; applyTheme(currentTheme); openArticle(NEWS_CAT_NVIDIA, 0); shot("article_nvidia");
   currentTheme = THEME_OLED; applyTheme(currentTheme);
+
+  // v3.7: ticker switched off keeps the bar; ShareNote rename
+  newsTickerOn = false; currentScreen = SCREEN_HOME; drawHomeScreen(clockNow()); shot("home_ticker_disabled");
+  tap(120, 295); shot("news_ticker_off");
+  newsTickerOn = true;
+  openMessages(); shot("sharenote");
 }

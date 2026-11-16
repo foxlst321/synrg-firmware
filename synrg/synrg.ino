@@ -78,7 +78,7 @@ struct Theme {
   RGB todo, notes, homework, weather, settings, more;
 };
 
-#define FIRMWARE_VERSION "v3.6"
+#define FIRMWARE_VERSION "v3.7"
 
 // ---- Over-the-air update: where the PDA looks for new firmware. These two
 // files live in the public GitHub repo. version.txt holds just the version
@@ -656,6 +656,7 @@ int savedNetCount = 0;
 char weatherTemp[10] = "--";
 char weatherDesc[24] = "Not fetched yet";
 bool weatherFetching = false;
+unsigned long weatherNextTryMs = 0;   // when the weather may be auto-synced again (0 = as soon as possible)
 int weatherCode = -1;                 // Open-Meteo weather code of the last fetch, -1 = none
 int weatherHigh = -999, weatherLow = -999;   // today's high / low in F, -999 = unknown
 
@@ -727,7 +728,7 @@ const int row0 = 104, row1 = 166, row2 = 228;
 #define TILE_COUNT 7
 #define TILE_MESSAGES 6
 #define TILE_ICON_R 15
-const char* tileNames[TILE_COUNT] = {"", "To-Do", "Notes", "Homework", "Weather", "Settings", "Messages"};
+const char* tileNames[TILE_COUNT] = {"", "To-Do", "Notes", "Homework", "Weather", "Settings", "ShareNote"};
 int tileX[TILE_COUNT] = {WIDGET_X, col0, col1, col0, col1, col1, col0};
 int tileY[TILE_COUNT] = {WIDGET_Y, row0, row0, row1, row1, row2, row2};
 
@@ -1381,9 +1382,9 @@ int callPeer(const char* ip, const String& pathAndQuery) {
 
 void describePeerError(int code, const char* doing) {
   if (code == -100) snprintf(msgStatus, sizeof(msgStatus), "No WiFi");
-  else if (code == 403) snprintf(msgStatus, sizeof(msgStatus), "They have messaging off");
+  else if (code == 403) snprintf(msgStatus, sizeof(msgStatus), "They have ShareNote off");
   else if (code == 410) snprintf(msgStatus, sizeof(msgStatus), "You're not in their contacts");
-  else if (code == 404) snprintf(msgStatus, sizeof(msgStatus), "Not a SynRG with Messages");
+  else if (code == 404) snprintf(msgStatus, sizeof(msgStatus), "Not a SynRG with ShareNote");
   else if (code < 0) snprintf(msgStatus, sizeof(msgStatus), "Couldn't reach that IP");
   else snprintf(msgStatus, sizeof(msgStatus), "%s failed (%d)", doing, code);
 }
@@ -1707,12 +1708,12 @@ void drawNearbyScreen() {
   if (nearbySearching) {
     printCentered(&FreeSansBold12pt7b, 120, 120, "Searching...", COLOR_TEXT);
     printCentered(&FreeSans9pt7b, 120, 156, "Looking for SynRGs", COLOR_SUBTEXT);
-    printCentered(&FreeSans9pt7b, 120, 176, "with Messaging on", COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 176, "with ShareNote on", COLOR_SUBTEXT);
     return;
   }
   if (nearbyCount == 0) {
     printCentered(&FreeSansBold12pt7b, 120, 100, "Nobody found", COLOR_TEXT);
-    printCentered(&FreeSans9pt7b, 120, 136, "They need Messaging on", COLOR_SUBTEXT);
+    printCentered(&FreeSans9pt7b, 120, 136, "They need ShareNote on", COLOR_SUBTEXT);
     printCentered(&FreeSans9pt7b, 120, 156, "and the same WiFi.", COLOR_SUBTEXT);
     printCentered(&FreeSans9pt7b, 120, 186, "Or go back and use By IP.", COLOR_SUBTEXT);
   }
@@ -1761,10 +1762,10 @@ void openMessages() {
 void drawMessagesScreen() {
   tft.fillScreen(COLOR_BG);
   drawScreenFrame();
-  drawBackBar("Messages");
+  drawBackBar("ShareNote");
 
   drawGlassRect(8, 30, 224, 30, 12, messagingOn ? COLOR_ACCENT : COLOR_SUBTEXT);
-  printFitted(&FreeSansBold12pt7b, 120, 37, messagingOn ? "Messaging: On" : "Messaging: Off", ILI9341_WHITE, 210);
+  printFitted(&FreeSansBold12pt7b, 120, 37, messagingOn ? "ShareNote: On" : "ShareNote: Off", ILI9341_WHITE, 210);
 
   if (contactScroll > contactCount - CONTACT_ROWS) contactScroll = contactCount - CONTACT_ROWS;
   if (contactScroll < 0) contactScroll = 0;
@@ -1848,7 +1849,7 @@ void handleMessagesTouch(int x, int y) {
     return;
   }
   if (y >= 280 && y <= 312) {                                  // Find Nearby / By IP
-    if (!messagingOn) { strcpy(msgStatus, "Turn Messaging on first"); drawMessagesScreen(); return; }
+    if (!messagingOn) { strcpy(msgStatus, "Turn ShareNote on first"); drawMessagesScreen(); return; }
     msgStatus[0] = '\0';
     if (x >= 8 && x <= 132) {
       if (WiFi.status() != WL_CONNECTED) { strcpy(msgStatus, "No WiFi"); drawMessagesScreen(); return; }
@@ -2507,7 +2508,11 @@ void drawNewsTicker() {
   tickerCanvas.setFont(&SynSmall);
   tickerCanvas.setTextWrap(false);
   tickerCanvas.setTextColor(COLOR_TEXT);
-  if (newsMixCount == 0) {
+  if (!newsTickerOn) {
+    tickerCanvas.setTextColor(COLOR_SUBTEXT);
+    tickerCanvas.setCursor(labelW + 6, 11);
+    tickerCanvas.print("Ticker disabled");
+  } else if (newsMixCount == 0) {
     tickerCanvas.setTextColor(COLOR_SUBTEXT);
     tickerCanvas.setCursor(labelW + 6, 11);
     tickerCanvas.print(!anyNewsCatOn() ? "Tap to choose topics" : WiFi.status() == WL_CONNECTED ? "Getting headlines..." : "Waiting for WiFi");
@@ -2523,7 +2528,8 @@ void drawNewsTicker() {
   tft.drawRGBBitmap(TICKER_X, TICKER_Y, tickerCanvas.getBuffer(), TICKER_W, TICKER_H);
 }
 
-// Called every loop() on Home: slides the ticker along.
+// Called every loop() on Home: slides the ticker along. (When the ticker is
+// switched off the bar stays put, showing "Ticker disabled".)
 void updateNewsTicker() {
   if (!newsTickerOn || msgBanner[0]) return;
   if (millis() - newsTickerMs < 40) return;
@@ -4111,7 +4117,7 @@ void drawHomeScreen(DateTime now) {
     drawTileIcon(i, TILE_ICON_R);
   }
   drawIpLine();
-  if (newsTickerOn && !msgBanner[0]) drawNewsTicker();
+  if (!msgBanner[0]) drawNewsTicker();
   if (msgBanner[0]) {                 // "Hound Dog accepted!" / "New message from ..."
     tft.fillRoundRect(20, 287, 200, 17, 8, COLOR_ACCENT);
     tft.setFont();
@@ -4880,31 +4886,24 @@ void drawWeatherScreen() {
   printFitted(&FreeSansBold12pt7b, 120, 274, "Refresh", ILI9341_WHITE, 90);
 }
 
-void fetchWeather() {
-  if (WiFi.status() != WL_CONNECTED) {
-    strcpy(weatherDesc, "Connect WiFi first");
-    strcpy(weatherTemp, "--");
-    weatherCode = -1; weatherHigh = weatherLow = -999;
-    drawWeatherScreen();
-    return;
-  }
-
-  weatherFetching = true;
-  drawWeatherScreen();
-
+// Downloads the current weather. On success the values are replaced and it
+// returns true; on any failure the previous values are left untouched.
+bool fetchWeatherData() {
+  if (WiFi.status() != WL_CONNECTED) return false;
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
+  http.setTimeout(8000);
   String url = "https://api.open-meteo.com/v1/forecast?latitude=" WEATHER_LAT "&longitude=" WEATHER_LON "&current_weather=true&temperature_unit=fahrenheit"
                "&daily=temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=auto";
   http.begin(client, url);
   int code = http.GET();
-
+  bool ok = false;
   if (code == 200) {
     String payload = http.getString();
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
-    if (!err) {
+    if (!err && !doc["current_weather"]["temperature"].isNull()) {
       float t = doc["current_weather"]["temperature"];
       int wcode = doc["current_weather"]["weathercode"];
       sprintf(weatherTemp, "%.0f", t);
@@ -4917,20 +4916,53 @@ void fetchWeather() {
       }
       strncpy(weatherDesc, weatherCodeToDesc(wcode), sizeof(weatherDesc) - 1);
       weatherDesc[sizeof(weatherDesc) - 1] = '\0';
-    } else {
-      strcpy(weatherDesc, "Parse error");
-      strcpy(weatherTemp, "--");
-      weatherCode = -1; weatherHigh = weatherLow = -999;
+      ok = true;
     }
-  } else {
+  }
+  http.end();
+  // fresh for 30 minutes; after a failure try again in 5
+  weatherNextTryMs = millis() + (ok ? 30UL * 60UL * 1000UL : 5UL * 60UL * 1000UL);
+  return ok;
+}
+
+// The Refresh button on the Weather screen.
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) {
+    strcpy(weatherDesc, "Connect WiFi first");
+    strcpy(weatherTemp, "--");
+    weatherCode = -1; weatherHigh = weatherLow = -999;
+    drawWeatherScreen();
+    return;
+  }
+  weatherFetching = true;
+  drawWeatherScreen();
+  if (!fetchWeatherData()) {
     strcpy(weatherDesc, "Fetch failed");
     strcpy(weatherTemp, "--");
     weatherCode = -1; weatherHigh = weatherLow = -999;
   }
-  http.end();
-
   weatherFetching = false;
   drawWeatherScreen();
+}
+
+// Weather auto-sync: while the PDA sits on Home or Lock with WiFi, the
+// weather is fetched shortly after start-up and then every 30 minutes.
+// A failed sync keeps the last reading, so the lock screen's weather card
+// (and the Weather widget) never blank out. Takes turns with the news
+// refresh so the screen is never held up for long.
+void weatherAutoRefresh(bool touching) {
+  if (touching || WiFi.status() != WL_CONNECTED) return;
+  if (currentScreen != SCREEN_HOME && currentScreen != SCREEN_LOCK) return;
+  if (millis() < 12000) return;
+  if (newsLastAutoMs != 0 && millis() - newsLastAutoMs < 15000) return;
+  if (weatherNextTryMs != 0 && (long)(millis() - weatherNextTryMs) < 0) return;
+  bool ok = fetchWeatherData();
+  newsLastAutoMs = millis();
+  if (!ok) return;
+  DateTime now = clockNow();
+  if (currentScreen == SCREEN_LOCK) drawLockScreen(now);
+  else if (homeWidget == WIDGET_WEATHER) drawHomeScreen(now);
+  lastDrawnMinute = now.minute();
 }
 
 // ============================================================
@@ -6140,6 +6172,7 @@ void loop() {
   pollDiscovery(false);
   updateBanner();
   if (currentScreen == SCREEN_HOME) updateNewsTicker();
+  weatherAutoRefresh(touchedNow);
   newsAutoRefresh(touchedNow);
   if (bannerActive && justTouched && touchY < 44) {   // tapped the banner
     openBannerChat();
